@@ -243,6 +243,11 @@ class FileMindApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
+        self._ai_search_mode = False   # never sticky across launches
+        self._last_user_mode = "dashboard"  # ONLY user actions change this
+        self._resize_job = None        # debounce handle for window resize/move
+        self._header_job = None        # debounce handle for header redraw
+        self._is_resizing = False      # True while the window is being dragged
         self._build_sidebar()
         self._build_main_area()
         self.sync_ai_mode_ui()       # start in a known, synced OFF state
@@ -250,7 +255,21 @@ class FileMindApp(ctk.CTk):
         self._pulse()
         self._start_system_monitor()  # live read-only metrics (after() loop)
 
-        self.after(120, lambda: self.switch_view("Dashboard"))
+        # responsive: react to window resize / monitor changes (debounced)
+        self.bind("<Configure>", self._on_window_configure)
+
+        self.after(120, self._startup_dashboard)
+
+    def _startup_dashboard(self):
+        """Guarantee a clean, non-sticky state on every launch: AI Search OFF,
+        no AI panel showing, no empty suggestion box."""
+        self._ai_search_mode = False
+        if hasattr(self, "_ai_panel"):
+            self._ai_panel.grid_remove()
+        if hasattr(self, "suggest_frame"):
+            self.suggest_frame.grid_remove()
+        self.sync_ai_mode_ui()
+        self.switch_view("Dashboard")
 
     # ═══════════════════════════════════════════════════════════ sidebar ══════
     def _build_sidebar(self):
@@ -402,7 +421,16 @@ class FileMindApp(ctk.CTk):
                                 bg="#0d1117")
         self.header.grid(row=0, column=0, columnspan=2, sticky="ew",
                          pady=(0, 10))
-        self.header.bind("<Configure>", lambda e: self._draw_header())
+        # debounce: avoid redrawing the gradient on every resize tick (drag lag)
+        self.header.bind("<Configure>", self._schedule_header_redraw)
+
+    def _schedule_header_redraw(self, _event=None):
+        if getattr(self, "_header_job", None):
+            try:
+                self.after_cancel(self._header_job)
+            except Exception:
+                pass
+        self._header_job = self.after(120, self._draw_header)
 
     def _draw_header(self):
         c = self.header
@@ -447,6 +475,34 @@ class FileMindApp(ctk.CTk):
         c.create_text(w - 65, h // 2, anchor="center",
                       text="🔒 READ-ONLY",
                       font=("Segoe UI", 9, "bold"), fill=NEON_GREEN)
+
+    # ───────────────────────── responsive / multi-monitor ─────────────────────
+    def _on_window_configure(self, event):
+        """Debounced resize/move handler (top-level window ONLY).
+
+        <Configure> fires many times per second while a window is dragged
+        between monitors. We must NOT do layout work on each tick — we only
+        flag that a resize is in progress and (re)arm a single deferred job."""
+        if event.widget is not self:
+            return
+        self._is_resizing = True
+        if getattr(self, "_resize_job", None):
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.after(250, self._handle_resize_done)
+
+    def _handle_resize_done(self):
+        """Runs ~250 ms after the window stops moving/resizing.
+
+        DELIBERATELY MINIMAL — it must NEVER change the layout. It only clears
+        the drag flag so the paused background loops (sensor poll, brain pulse)
+        resume. It does NOT rebuild widgets, does NOT toggle any visibility, and
+        does NOT call show_dashboard / show_ai_search_panel / hide_ai_search_panel
+        / show_recent. Moving between monitors must leave the UI exactly as-is."""
+        self._resize_job = None
+        self._is_resizing = False
 
     # ═══════════════════════════════════════════════════════════ cards ════════
     def _make_card(self, parent, col, emoji, title, on_click):
@@ -528,81 +584,175 @@ class FileMindApp(ctk.CTk):
         return {"value": value, "sub": sub, "bar": bar}
 
     def _build_dashboard_monitor(self, parent):
-        """Build the live-monitor strip + AI Command Center inside the cards
-        frame (rows 1 & 2). Hidden until the Dashboard is shown."""
-        # ── live metric strip (row 1 of the cards frame) ──
-        strip = ctk.CTkFrame(parent, fg_color="transparent")
-        strip.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        """Build the live-monitor strip + AI Mission Control inside ONE
+        scrollable container that occupies the central (flexible) row and
+        swaps with the file table on the Dashboard. This makes the whole
+        dashboard vertically scrollable with a single scrollbar."""
+        main_area = parent.master            # the central grid frame ('main')
+        self.dash_scroll = ctk.CTkScrollableFrame(
+            main_area, fg_color="transparent",
+            scrollbar_button_color="#1e2a40",
+            scrollbar_button_hover_color="#2a3a52")
+        self.dash_scroll.grid(row=7, column=0, columnspan=2, sticky="nsew")
+        self.dash_scroll.grid_columnconfigure(0, weight=1)
+        self.dash_scroll.grid_remove()       # shown only on the Dashboard
+
+        # ── live metric strip (inside the scroll container) ──
+        strip = ctk.CTkFrame(self.dash_scroll, fg_color="transparent")
+        strip.grid(row=0, column=0, sticky="ew", pady=(2, 0))
         self._monitor_strip = strip
         self._metrics = {
-            "cpu":     self._metric_card(strip, 0, "🧮", "CPU", NEON_CYAN),
-            "ram":     self._metric_card(strip, 1, "💾", "RAM", NEON_PURPLE),
-            "gpu":     self._metric_card(strip, 2, "🎮", "GPU", NEON_GREEN),
-            "disk_c":  self._metric_card(strip, 3, "🗄️", "DISK C", NEON_ORANGE),
-            "disk_d":  self._metric_card(strip, 4, "🗄️", "DISK D", NEON_ORANGE),
-            "disk_e":  self._metric_card(strip, 5, "🗄️", "DISK E", NEON_ORANGE),
-            "battery": self._metric_card(strip, 6, "🔋", "BATTERY", NEON_GREEN),
+            "cpu":      self._metric_card(strip, 0, "🧮", "CPU", NEON_CYAN),
+            "ram":      self._metric_card(strip, 1, "💾", "RAM", NEON_PURPLE),
+            "gpu":      self._metric_card(strip, 2, "🎮", "GPU", NEON_GREEN),
+            "disk_c":   self._metric_card(strip, 3, "🗄️", "DISK C", NEON_ORANGE),
+            "disk_d":   self._metric_card(strip, 4, "🗄️", "DISK D", NEON_ORANGE),
+            "disk_e":   self._metric_card(strip, 5, "🗄️", "DISK E", NEON_ORANGE),
+            "battery":  self._metric_card(strip, 6, "🔋", "BATTERY", NEON_GREEN),
+            "net_down": self._metric_card(strip, 7, "⬇️", "NET DOWN",
+                                          NEON_CYAN, with_bar=False),
+            "net_up":   self._metric_card(strip, 8, "⬆️", "NET UP",
+                                          NEON_PINK, with_bar=False),
         }
 
-        # ── AI Command Center (row 2 of the cards frame) ──
-        cc = ctk.CTkFrame(parent, corner_radius=12, fg_color="#12182e",
+        # ── AI Mission Control (inside the scroll container) ──
+        cc = ctk.CTkFrame(self.dash_scroll, corner_radius=12,
+                          fg_color="#12182e",
                           border_width=1, border_color=NEON_PURPLE)
-        cc.grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
-        cc.grid_columnconfigure(0, weight=1)
-        cc.grid_columnconfigure(1, weight=1)
-        cc.grid_columnconfigure(2, weight=1)
+        cc.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        cc.grid_columnconfigure(0, weight=0)   # brain (fixed)
+        cc.grid_columnconfigure(1, weight=1)   # timeline
+        cc.grid_columnconfigure(2, weight=1)   # quick actions
         self._cmd_center = cc
 
-        ctk.CTkLabel(cc, text="🛰  AI Command Center",
+        ctk.CTkLabel(cc, text="🛰  AI Mission Control",
                      font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=NEON_CYAN).grid(
             row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 2))
 
-        # column 0 — live status
-        stat = ctk.CTkFrame(cc, fg_color="transparent")
-        stat.grid(row=1, column=0, sticky="nw", padx=12, pady=(0, 10))
-        ctk.CTkLabel(stat, text="STATUS",
+        # column 0 — animated AI Brain visualizer + live status
+        self._build_brain_visualizer(cc)
+
+        # column 1 — command timeline
+        tl = ctk.CTkFrame(cc, fg_color="transparent")
+        tl.grid(row=1, column=1, sticky="nw", padx=12, pady=(0, 10))
+        ctk.CTkLabel(tl, text="🕓  COMMAND TIMELINE",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#506080").pack(anchor="w")
-        self._cc_brain = ctk.CTkLabel(stat, text="🧠 AI Brain: …",
-                                      font=ctk.CTkFont(size=11),
-                                      text_color="#c8d4f0")
-        self._cc_brain.pack(anchor="w", pady=1)
-        self._cc_aisearch = ctk.CTkLabel(stat, text="🔍 AI Search: Off",
-                                         font=ctk.CTkFont(size=11),
-                                         text_color="#c8d4f0")
-        self._cc_aisearch.pack(anchor="w", pady=1)
-        self._cc_net = ctk.CTkLabel(stat, text="🌐 Network: …",
-                                    font=ctk.CTkFont(size=11),
-                                    text_color="#c8d4f0")
-        self._cc_net.pack(anchor="w", pady=1)
-        self._cc_project = ctk.CTkLabel(stat, text="📂 Active Project: —",
-                                        font=ctk.CTkFont(size=11),
-                                        text_color="#c8d4f0",
-                                        wraplength=210, justify="left")
-        self._cc_project.pack(anchor="w", pady=1)
+        self._cc_timeline_box = ctk.CTkFrame(tl, fg_color="transparent")
+        self._cc_timeline_box.pack(anchor="w", fill="x")
 
-        # column 1 — recent AI commands
-        recent = ctk.CTkFrame(cc, fg_color="transparent")
-        recent.grid(row=1, column=1, sticky="nw", padx=12, pady=(0, 10))
-        ctk.CTkLabel(recent, text="RECENT COMMANDS",
-                     font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color="#506080").pack(anchor="w")
-        self._cc_recent_box = ctk.CTkFrame(recent, fg_color="transparent")
-        self._cc_recent_box.pack(anchor="w", fill="x")
-
-        # column 2 — suggested actions + project shortcuts
+        # column 2 — AI quick actions + file insights
         acts = ctk.CTkFrame(cc, fg_color="transparent")
         acts.grid(row=1, column=2, sticky="nw", padx=12, pady=(0, 10))
-        ctk.CTkLabel(acts, text="SUGGESTED ACTIONS",
+        ctk.CTkLabel(acts, text="⚡  AI QUICK ACTIONS",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#506080").pack(anchor="w")
         self._cc_actions_box = ctk.CTkFrame(acts, fg_color="transparent")
         self._cc_actions_box.pack(anchor="w", fill="x")
+        ctk.CTkLabel(acts, text="🔎  FILE INSIGHTS",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#506080").pack(anchor="w", pady=(8, 0))
+        self._cc_insights_box = ctk.CTkFrame(acts, fg_color="transparent")
+        self._cc_insights_box.pack(anchor="w", fill="x")
 
-        # hidden until the Dashboard is active
-        strip.grid_remove()
-        cc.grid_remove()
+        # row 2 — smart project cards
+        ctk.CTkLabel(cc, text="📂  SMART PROJECTS",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#506080").grid(
+            row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 0))
+        self._cc_projects_box = ctk.CTkFrame(cc, fg_color="transparent")
+        self._cc_projects_box.grid(row=3, column=0, columnspan=3,
+                                   sticky="ew", padx=8, pady=(2, 10))
+
+        # whole scroll container hidden until the Dashboard is active
+
+    # ── animated AI Brain visualizer ─────────────────────────────────────────
+    _BRAIN_STATES = {
+        "Offline":    ("#5a6680", "🧠 Offline"),
+        "Connecting": (NEON_CYAN, "🧠 Connecting…"),
+        "Thinking":   (NEON_CYAN, "🧠 Thinking…"),
+        "Searching":  (NEON_PURPLE, "🧠 Searching files…"),
+        "Analyzing":  (NEON_ORANGE, "🧠 Generating answer…"),
+        "Ready":      (NEON_GREEN, "🧠 Ready"),
+    }
+
+    def _build_brain_visualizer(self, parent):
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=1, column=0, sticky="nw", padx=12, pady=(0, 10))
+        ctk.CTkLabel(box, text="🧠  AI BRAIN",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#506080").pack(anchor="w")
+        self._brain_canvas = tk.Canvas(box, width=120, height=96,
+                                       bg="#12182e", highlightthickness=0, bd=0)
+        self._brain_canvas.pack(anchor="w", pady=(2, 2))
+        self._brain_state = "Offline"
+        self._brain_busy = False
+        self._brain_phase = 0
+        self._brain_state_lbl = ctk.CTkLabel(
+            box, text="🧠 Offline", font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#5a6680")
+        self._brain_state_lbl.pack(anchor="w")
+
+        # compact live status lines (kept for _apply_cc_status compatibility)
+        self._cc_brain = ctk.CTkLabel(box, text="LM Studio: …",
+                                      font=ctk.CTkFont(size=10),
+                                      text_color="#8090b0")
+        self._cc_brain.pack(anchor="w")
+        self._cc_aisearch = ctk.CTkLabel(box, text="AI Search: Off",
+                                         font=ctk.CTkFont(size=10),
+                                         text_color="#8090b0")
+        self._cc_aisearch.pack(anchor="w")
+        self._cc_net = ctk.CTkLabel(box, text="Network: …",
+                                    font=ctk.CTkFont(size=10),
+                                    text_color="#8090b0")
+        self._cc_net.pack(anchor="w")
+        self._cc_project = ctk.CTkLabel(box, text="Project: —",
+                                        font=ctk.CTkFont(size=10),
+                                        text_color="#8090b0",
+                                        wraplength=130, justify="left")
+        self._cc_project.pack(anchor="w")
+        self._animate_brain()
+
+    def _set_brain_state(self, state):
+        """Set the brain visualizer state (Offline/Connecting/Thinking/
+        Searching/Analyzing/Ready). Safe to call from the main thread."""
+        if state not in self._BRAIN_STATES:
+            return
+        self._brain_state = state
+        color, text = self._BRAIN_STATES[state]
+        if hasattr(self, "_brain_state_lbl"):
+            self._brain_state_lbl.configure(text=text, text_color=color)
+
+    def _animate_brain(self):
+        """Lightweight neon pulse — redraws a few rings every ~130 ms.
+        Only updates the existing canvas; it never rebuilds widgets."""
+        c = getattr(self, "_brain_canvas", None)
+        if c is None:
+            return
+        if getattr(self, "_is_resizing", False):
+            # pause canvas redraws while the window is being dragged
+            self.after(130, self._animate_brain)
+            return
+        try:
+            self._brain_phase = (self._brain_phase + 1) % 1000
+            color = self._BRAIN_STATES.get(
+                self._brain_state, (NEON_GREEN, ""))[0]
+            # faster pulse while the brain is busy
+            speed = 0.45 if self._brain_state in (
+                "Thinking", "Searching", "Analyzing", "Connecting") else 0.18
+            import math
+            cx, cy = 60, 48
+            c.delete("all")
+            for i, base in enumerate((34, 26, 18, 10)):
+                amp = 4 if self._brain_state != "Offline" else 1
+                r = base + amp * math.sin(self._brain_phase * speed - i * 0.6)
+                c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                              outline=color, width=2)
+            c.create_text(cx, cy, text="🧠", font=("Segoe UI", 18))
+        except Exception:
+            pass
+        self.after(130, self._animate_brain)
 
     def _cc_button(self, parent, text, cmd):
         b = ctk.CTkButton(parent, text=text, anchor="w", height=26,
@@ -615,70 +765,178 @@ class FileMindApp(ctk.CTk):
         return b
 
     def _show_dashboard_monitor(self, show):
-        if not hasattr(self, "_monitor_strip"):
+        """Swap the scrollable Mission-Control page in/out of the central row.
+
+        show=True  → Dashboard page visible (file table + preview hidden)
+        show=False → file table + preview restored (unless AI mode is on)."""
+        if not hasattr(self, "dash_scroll"):
             return
         if show:
-            self._monitor_strip.grid()
-            self._cmd_center.grid()
+            if hasattr(self, "_table_frame"):
+                self._table_frame.grid_remove()
+            if hasattr(self, "_preview_panel"):
+                self._preview_panel.grid_remove()
+            # never leave an empty suggestion box on the Dashboard
+            if hasattr(self, "suggest_frame"):
+                self.suggest_frame.grid_remove()
+            self.dash_scroll.grid()
             self._refresh_command_center()
         else:
-            self._monitor_strip.grid_remove()
-            self._cmd_center.grid_remove()
+            self.dash_scroll.grid_remove()
+            if not self._ai_search_mode:
+                if hasattr(self, "_table_frame"):
+                    self._table_frame.grid()
+                if hasattr(self, "_preview_panel"):
+                    self._preview_panel.grid()
 
     def _refresh_command_center(self):
-        """Rebuild the recent-commands list + suggested actions / shortcuts.
+        """Rebuild timeline + quick actions + file insights + project cards.
         Cheap, called only when the Dashboard becomes visible."""
-        if not hasattr(self, "_cc_recent_box"):
+        if not hasattr(self, "_cc_timeline_box"):
             return
 
-        # AI Search status label
         on = getattr(self, "_ai_search_mode", False)
         self._cc_aisearch.configure(
-            text="🔍 AI Search: " + ("On" if on else "Off"))
+            text="AI Search: " + ("On" if on else "Off"))
 
-        # recent commands
-        for w in self._cc_recent_box.winfo_children():
+        # ── command timeline (last 50 kept in DB; show most recent) ──
+        for w in self._cc_timeline_box.winfo_children():
             w.destroy()
         try:
-            cmds = self.db.recent_commands(5)
+            cmds = self.db.recent_commands(50)
         except Exception:
             cmds = []
         if cmds:
-            for h in cmds[:4]:
-                txt = h.get("command", "")[:26]
-                self._cc_button(self._cc_recent_box, f"⌨  {txt}",
+            for h in cmds[:6]:
+                ts = (h.get("ran_at", "") or "")[11:16]      # HH:MM
+                cmd = (h.get("command", "") or "")[:24]
+                self._cc_button(self._cc_timeline_box, f"[{ts}]  {cmd}",
                                 lambda c=h.get("command", ""): self._rerun(c))
         else:
-            ctk.CTkLabel(self._cc_recent_box, text="No commands yet.",
+            ctk.CTkLabel(self._cc_timeline_box, text="No activity yet.",
                          font=ctk.CTkFont(size=11),
                          text_color="#506080").pack(anchor="w")
 
-        # suggested actions + project shortcuts
+        # ── AI quick actions (dynamic) ──
         for w in self._cc_actions_box.winfo_children():
             w.destroy()
-        self._cc_button(self._cc_actions_box, "🕒  Recent files",
-                        self.show_recent)
-        self._cc_button(self._cc_actions_box, "📥  Downloads",
+        self._cc_button(self._cc_actions_box, "📥  Open Downloads",
                         self.show_downloads)
-        self._cc_button(self._cc_actions_box, "🔍  AI Search",
-                        self._toggle_ai_search)
+        # dynamic project openers (FileMind / POS / …) via existing routing
         try:
-            recent_projects = self.projects.recent(2)
+            projects = self.projects.all()
         except Exception:
-            recent_projects = []
-        for p in recent_projects:
-            nm = p.get("name", "")
-            self._cc_button(self._cc_actions_box, f"📂  Open {nm[:18]}",
-                            lambda n=nm: self.execute_command_text(
-                                f"open {n} project"))
+            projects = []
+        pnames = {p.get("name", "").lower(): p.get("name", "") for p in projects}
 
-        # active project label
+        def _proj_action(label, *keywords):
+            for kw in keywords:
+                for low, real in pnames.items():
+                    if kw in low:
+                        self._cc_button(
+                            self._cc_actions_box, label,
+                            lambda n=real: self.execute_command_text(
+                                f"open {n} project"))
+                        return
+        _proj_action("🧠  Open FileMind", "filemind", "file mind")
+        _proj_action("🏪  Open POS App", "pos")
+        self._cc_button(self._cc_actions_box, "🕒  Recent Files",
+                        self.show_recent)
+        self._cc_button(self._cc_actions_box, "📄  Search PDFs",
+                        lambda: self._insight_by_ext("PDFs", ".pdf"))
+        self._cc_button(self._cc_actions_box, "🖼  Search Images",
+                        lambda: self.filter_by_category("Images"))
+
+        # ── file insights ──
+        for w in self._cc_insights_box.winfo_children():
+            w.destroy()
+        self._cc_button(self._cc_insights_box, "🐘  Largest Files",
+                        self.show_large)
+        self._cc_button(self._cc_insights_box, "🕒  Recent Files",
+                        self.show_recent)
+        self._cc_button(self._cc_insights_box, "📄  Recent PDFs",
+                        lambda: self._insight_by_ext("Recent PDFs", ".pdf"))
+        self._cc_button(self._cc_insights_box, "🖼  Recent Images",
+                        lambda: self.filter_by_category("Images"))
+        self._cc_button(self._cc_insights_box, "📝  Recent Documents",
+                        lambda: self.filter_by_category("Documents"))
+
+        # ── smart project cards ──
+        self._refresh_project_cards()
+
+        # active-project label
         try:
             act = self.projects.recent(1)
         except Exception:
             act = []
         self._cc_project.configure(
-            text="📂 Active Project: " + (act[0]["name"] if act else "—"))
+            text="Project: " + (act[0]["name"] if act else "—"))
+
+    def _insight_by_ext(self, label, ext):
+        """Read-only search of the index by extension (e.g. all PDFs)."""
+        self._load_async(
+            lambda: self.search.search(extension=ext, limit=RESULT_LIMIT),
+            label, group_as_files=True)
+
+    def _refresh_project_cards(self):
+        """Modern project cards: name · path · last opened + Open / Folder."""
+        box = self._cc_projects_box
+        for w in box.winfo_children():
+            w.destroy()
+        try:
+            projects = self.projects.all()
+        except Exception:
+            projects = []
+        if not projects:
+            ctk.CTkLabel(box, text="No projects yet — type "
+                         "'remember project <name>'.",
+                         font=ctk.CTkFont(size=11),
+                         text_color="#506080").pack(anchor="w", padx=4)
+            return
+        for i, p in enumerate(projects[:6]):
+            box.grid_columnconfigure(i, weight=1)
+            card = ctk.CTkFrame(box, corner_radius=10, fg_color=GLASS_BG,
+                                border_width=1, border_color=GLASS_BORDER)
+            card.grid(row=0, column=i, sticky="nsew", padx=4, pady=2)
+            name = p.get("name", "")
+            folder = p.get("folder", "")
+            last = ProjectRegistry.friendly_time(p.get("last_opened", ""))
+            ctk.CTkLabel(card, text=f"📂  {name}",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=NEON_CYAN).pack(anchor="w", padx=8,
+                                                    pady=(6, 0))
+            ctk.CTkLabel(card, text=folder, font=ctk.CTkFont(size=9),
+                         text_color="#607090", wraplength=150,
+                         justify="left").pack(anchor="w", padx=8)
+            ctk.CTkLabel(card, text=f"🕐 {last}", font=ctk.CTkFont(size=9),
+                         text_color="#8090b0").pack(anchor="w", padx=8,
+                                                    pady=(0, 4))
+            brow = ctk.CTkFrame(card, fg_color="transparent")
+            brow.pack(fill="x", padx=6, pady=(0, 6))
+            ctk.CTkButton(brow, text="Open", height=24, width=10,
+                          corner_radius=8, fg_color=ACCENT,
+                          hover_color="#3a4db0",
+                          font=ctk.CTkFont(size=11),
+                          command=lambda n=name: self._open_project(n)
+                          ).pack(side="left", expand=True, fill="x", padx=2)
+            ctk.CTkButton(brow, text="Folder", height=24, width=10,
+                          corner_radius=8, fg_color=GLASS_BG,
+                          hover_color=GLASS_HOVER, border_width=1,
+                          border_color=GLASS_BORDER,
+                          font=ctk.CTkFont(size=11),
+                          command=lambda f=folder: self._open_project_folder(f)
+                          ).pack(side="left", expand=True, fill="x", padx=2)
+
+    def _open_project_folder(self, folder):
+        """Open a project folder in Explorer (read-only)."""
+        try:
+            if folder and os.path.isdir(folder):
+                os.startfile(folder)
+                self._set_status(f"Opened folder: {folder}")
+            else:
+                self._set_status("Project folder not found.")
+        except Exception as e:
+            self._set_status(f"Error: {e}")
 
     def execute_command_text(self, text):
         """Run a command string through the normal routing (used by shortcuts)."""
@@ -702,8 +960,11 @@ class FileMindApp(ctk.CTk):
         self.after(800, self._poll_system)     # first read shortly after launch
 
     def _poll_system(self):
-        """Schedule a background snapshot, then reschedule. Never blocks UI."""
-        if not getattr(self, "_sysmon_busy", False):
+        """Schedule a background snapshot, then reschedule. Never blocks UI.
+        Only updates existing labels/progress bars — never rebuilds layout."""
+        # pause sensor reads while the window is being dragged/resized
+        if not getattr(self, "_sysmon_busy", False) \
+                and not getattr(self, "_is_resizing", False):
             self._sysmon_busy = True
 
             def work():
@@ -735,7 +996,8 @@ class FileMindApp(ctk.CTk):
                         if m["bar"]:
                             m["bar"].set(0)
             else:
-                self._apply_cpu(data.get("cpu"), data.get("cores"))
+                self._apply_cpu(data.get("cpu"), data.get("cores"),
+                                data.get("cpu_temp"))
                 ram = data.get("ram")
                 self._update_metric(
                     "ram", ram.get("percent") if ram else None, "%",
@@ -749,13 +1011,27 @@ class FileMindApp(ctk.CTk):
                                 ("E", "disk_e")):
                 self._apply_disk(key, disks.get(letter), letter)
 
-            self._apply_gpu(data.get("gpu"))                 # unchanged
+            self._apply_gpu(data.get("gpu"))                 # + VRAM/temp
             self._apply_battery(data.get("battery"), psutil_ok)
             self._apply_cc_status(data.get("network"), psutil_ok)
+            self._apply_net_speed(data.get("net_speed"))
         except Exception:
             pass   # a sensor hiccup must never crash the UI
 
-    def _apply_cpu(self, raw, cores):
+    def _apply_net_speed(self, ns):
+        down = self._metrics.get("net_down")
+        up = self._metrics.get("net_up")
+        if ns is None:
+            for m in (down, up):
+                if m:
+                    m["value"].configure(text="—")
+            return
+        if down:
+            down["value"].configure(text=f"{human_size(ns.get('down', 0))}/s")
+        if up:
+            up["value"].configure(text=f"{human_size(ns.get('up', 0))}/s")
+
+    def _apply_cpu(self, raw, cores, temp=None):
         """Smoothed, Task-Manager-like CPU %.
 
         Keeps the last 5 raw samples and shows a trimmed mean (one min and one
@@ -782,9 +1058,14 @@ class FileMindApp(ctk.CTk):
         if m["bar"]:
             m["bar"].set(max(0.0, min(1.0, disp / 100.0)))
         c = self._cpu_cores or {}
+        sub = ""
         if c.get("physical") and c.get("logical"):
-            m["sub"].configure(
-                text=f"{c['physical']} cores · {c['logical']} threads")
+            sub = f"{c['physical']}C · {c['logical']}T"
+        if temp is not None:
+            sub = (sub + "  ·  " if sub else "") + f"{temp:.0f}°C"
+        elif sub:
+            sub += "  ·  Temp N/A"
+        m["sub"].configure(text=sub or "")
 
     def _apply_disk(self, key, d, letter):
         m = self._metrics.get(key)
@@ -840,9 +1121,11 @@ class FileMindApp(ctk.CTk):
             if m["bar"]:
                 m["bar"].set(max(0.0, min(1.0, load / 100.0)))
         temp = gpu.get("temp")
-        m["sub"].configure(
-            text=(f"{temp:.0f}°C" if temp is not None else "Temp N/A")
-            + "  ·  FPS N/A")
+        mu, mt = gpu.get("mem_used"), gpu.get("mem_total")
+        parts = [f"{temp:.0f}°C" if temp is not None else "Temp N/A"]
+        if mu is not None and mt:
+            parts.append(f"VRAM {mu:.0f}/{mt:.0f}MB")
+        m["sub"].configure(text="  ·  ".join(parts))
 
     def _apply_battery(self, bat, psutil_ok=True):
         m = self._metrics.get("battery")
@@ -1136,6 +1419,7 @@ class FileMindApp(ctk.CTk):
             border_width=2, border_color=NEON_PURPLE)
         panel.grid(row=7, column=1, sticky="nsew", padx=(8, 0))
         panel.grid_propagate(flag=False)
+        self._preview_panel = panel   # so the dashboard scroll page can hide it
 
         ctk.CTkLabel(
             panel, text="📋  FILE DETAILS",
@@ -1362,6 +1646,9 @@ class FileMindApp(ctk.CTk):
         # navigating to any normal view always leaves AI Search mode
         self._leave_ai_mode()
         self.current_view = name
+        # record the user's chosen mode (resize/<Configure> never touches this)
+        self._last_user_mode = (
+            "explorer" if name in ("Explorer", "Drives") else "dashboard")
         for n, b in self.nav_buttons.items():
             b.configure(fg_color=ACCENT if n == name else "transparent")
 
@@ -1384,7 +1671,7 @@ class FileMindApp(ctk.CTk):
             self.suggest_frame.grid_remove()
 
         if name == "Dashboard":
-            self.show_recent()
+            pass   # Mission Control scroll page shown by _show_dashboard_monitor
         elif name == "Explorer":
             # Sidebar Explorer button always lands on home, not a previous drive
             self._show_explorer_home()
@@ -1884,6 +2171,12 @@ class FileMindApp(ctk.CTk):
                 if hasattr(self, "_brain_status_lbl"):
                     self._brain_status_lbl.configure(
                         text=brain_txt, text_color=brain_color)
+                if hasattr(self, "_cc_brain"):
+                    self._cc_brain.configure(
+                        text="LM Studio: " + ("Online" if lm_ok else "Offline"))
+                # drive the brain visualizer (but never override an active search)
+                if not getattr(self, "_brain_busy", False):
+                    self._set_brain_state("Ready" if lm_ok else "Offline")
                 # reschedule next poll on the main thread
                 self.after(5000, self._update_ai_status)
             self.after(0, _upd)
@@ -2013,7 +2306,13 @@ class FileMindApp(ctk.CTk):
     def show_ai_search_panel(self):
         """Bring the AI Search panel to the front: hide the dashboard widgets,
         the file table and the explorer bar, then show the panel. Works from
-        ANY page (Dashboard included)."""
+        ANY page (Dashboard included).
+
+        HARD GUARD: the panel may appear ONLY when AI Search is actually ON
+        (a state set exclusively by the AI Search button / explicit command).
+        This makes it impossible for a resize / monitor move to open it."""
+        if not self._ai_search_mode:
+            return
         for name in ("cards_frame", "quick_frame", "explorer_bar"):
             w = getattr(self, name, None)
             if w is not None:
@@ -2045,6 +2344,9 @@ class FileMindApp(ctk.CTk):
         dashboard refresh can't hide the panel)."""
         if self._ai_search_mode:
             return
+        # the suggestion box only belongs to the Suggestions view
+        if self.current_view != "Suggestions" and hasattr(self, "suggest_frame"):
+            self.suggest_frame.grid_remove()
         explorer_like = self.current_view in ("Explorer", "Drives")
         if explorer_like:
             self.cards_frame.grid_remove()
@@ -2055,9 +2357,8 @@ class FileMindApp(ctk.CTk):
             self.explorer_bar.grid_remove()
             self.cards_frame.grid()
             self.quick_frame.grid()
+        # the swap below also restores the file table for non-Dashboard views
         self._show_dashboard_monitor(self.current_view == "Dashboard")
-        if hasattr(self, "_table_frame"):
-            self._table_frame.grid()
 
     def sync_ai_mode_ui(self):
         """Single source of truth → make every AI-mode UI element match
@@ -2078,7 +2379,10 @@ class FileMindApp(ctk.CTk):
             self._enter_ai_search_mode()
 
     def _enter_ai_search_mode(self):
+        # AI Search can be enabled ONLY here (sidebar button or explicit
+        # AI-search command) — never from a resize / <Configure> event.
         self._ai_search_mode = True
+        self._last_user_mode = "ai_search"
         self._ai_selected_row = None
         self.show_ai_search_panel()     # bring panel to front from any page
         self.sync_ai_mode_ui()
@@ -2090,6 +2394,9 @@ class FileMindApp(ctk.CTk):
     def _exit_ai_search_mode(self):
         was_on = self._ai_search_mode
         self._ai_search_mode = False
+        self._last_user_mode = (
+            "explorer" if self.current_view in ("Explorer", "Drives")
+            else "dashboard")
         self.hide_ai_search_panel()
         self.show_dashboard()
         self.sync_ai_mode_ui()
@@ -2333,6 +2640,8 @@ class FileMindApp(ctk.CTk):
             return
 
         info = self._ai_understand(query)
+        self._brain_busy = True
+        self._set_brain_state("Searching")          # brain pulses while busy
         if self._ai_search_mode:
             self._ai_panel_thinking(query, info)
         else:
@@ -2344,13 +2653,22 @@ class FileMindApp(ctk.CTk):
                 groups = self._ai_search_files(info, query)
             except Exception as e:
                 self.after(0, self._set_status, f"AI Search error: {e}")
+                self.after(0, self._brain_done)
                 return
             self.after(0, self._present_ai_results, query, info, groups)
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _brain_done(self):
+        """Settle the brain back to Ready/Offline after a search."""
+        self._brain_busy = False
+        self._set_brain_state("Ready" if getattr(self, "_lmstudio_online",
+                                                 False) else "Offline")
+
     def _present_ai_results(self, query, info, groups):
         """Route results to the AI panel (AI mode) or the table (normal mode)."""
+        self._set_brain_state("Analyzing")          # "Generating answer…"
+        self.after(700, self._brain_done)           # settle back to Ready
         if self._ai_search_mode:
             self._ai_panel_render(query, info, groups)
             return
@@ -2909,7 +3227,21 @@ class FileMindApp(ctk.CTk):
         self._rows_by_id[iid] = row
         return iid
 
+    def _reveal_table(self):
+        """Make sure the file table is visible (used when results load while
+        the Dashboard scroll page is showing). No-op in AI mode."""
+        if self._ai_search_mode:
+            return
+        if getattr(self, "dash_scroll", None) is not None \
+                and self.dash_scroll.winfo_ismapped():
+            self.dash_scroll.grid_remove()
+            if hasattr(self, "_table_frame"):
+                self._table_frame.grid()
+            if hasattr(self, "_preview_panel"):
+                self._preview_panel.grid()
+
     def show_results(self, rows, message=""):
+        self._reveal_table()
         self.tree.delete(*self.tree.get_children())
         self._rows_by_id.clear()
         self._current_rows = rows
@@ -2920,6 +3252,7 @@ class FileMindApp(ctk.CTk):
             self._set_status(message)
 
     def show_grouped(self, sections):
+        self._reveal_table()
         self.tree.delete(*self.tree.get_children())
         self._rows_by_id.clear()
         self._current_rows = [r for _, rows in sections for r in rows]
@@ -2990,6 +3323,7 @@ class FileMindApp(ctk.CTk):
             "No projects yet - click 'Add Project'.")
 
     def show_commands_help(self):
+        self._reveal_table()
         self.tree.delete(*self.tree.get_children())
         self._rows_by_id.clear()
         self._current_rows = []
@@ -3004,6 +3338,7 @@ class FileMindApp(ctk.CTk):
             return self.db.recent_commands(50)
 
         def done(items):
+            self._reveal_table()
             self.tree.delete(*self.tree.get_children())
             self._rows_by_id.clear()
             self._current_rows = []

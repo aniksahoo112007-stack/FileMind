@@ -12,6 +12,7 @@ because a metric is unavailable.
 import os
 import shutil
 import subprocess
+import time
 
 # Optional dependencies — degrade gracefully if absent.
 try:
@@ -149,6 +150,56 @@ def battery():
         return None
 
 
+def cpu_temp():
+    """CPU temperature in °C, or None if the platform exposes no sensor
+    (common on Windows). Never raises."""
+    if not HAS_PSUTIL:
+        return None
+    fn = getattr(psutil, "sensors_temperatures", None)
+    if fn is None:
+        return None
+    try:
+        temps = fn()
+        if not temps:
+            return None
+        for key in ("coretemp", "k10temp", "cpu_thermal", "acpitz", "cpu"):
+            arr = temps.get(key)
+            if arr:
+                return float(arr[0].current)
+        for arr in temps.values():       # fallback: first available reading
+            if arr:
+                return float(arr[0].current)
+        return None
+    except Exception:
+        return None
+
+
+# Module-level cache so net_speed() can compute a delta between calls.
+_net_last = {"t": None, "sent": 0, "recv": 0}
+
+
+def net_speed():
+    """Upload / download throughput in bytes/sec, measured as the delta of
+    total counters between calls. First call returns 0/0 (priming)."""
+    if not HAS_PSUTIL:
+        return None
+    try:
+        io = psutil.net_io_counters()
+        now = time.time()
+        up = down = 0.0
+        if _net_last["t"] is not None:
+            dt = now - _net_last["t"]
+            if dt > 0:
+                up = max(0.0, (io.bytes_sent - _net_last["sent"]) / dt)
+                down = max(0.0, (io.bytes_recv - _net_last["recv"]) / dt)
+        _net_last["t"] = now
+        _net_last["sent"] = io.bytes_sent
+        _net_last["recv"] = io.bytes_recv
+        return {"up": up, "down": down}
+    except Exception:
+        return None
+
+
 def network():
     if not HAS_PSUTIL:
         return None
@@ -225,11 +276,13 @@ def snapshot(check_gpu=True):
     don't keep spawning nvidia-smi).
     """
     return {
-        "cpu":     cpu_percent(0.1),
-        "cores":   cpu_cores(),
-        "ram":     ram(),
-        "disks":   disks(("C", "D", "E")),
-        "battery": battery(),
-        "network": network(),
-        "gpu":     gpu() if check_gpu else None,
+        "cpu":       cpu_percent(0.1),
+        "cpu_temp":  cpu_temp(),
+        "cores":     cpu_cores(),
+        "ram":       ram(),
+        "disks":     disks(("C", "D", "E")),
+        "battery":   battery(),
+        "network":   network(),
+        "net_speed": net_speed(),
+        "gpu":       gpu() if check_gpu else None,
     }
