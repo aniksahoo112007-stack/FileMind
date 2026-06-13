@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.sqlite
+*.sqlite-wal
+*.db
+*.log
+.env
+.vscode/
+data/
+logs/
