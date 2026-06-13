@@ -2079,6 +2079,8 @@ class FileMindApp(ctk.CTk):
                     f'Find "{q}"', group_as_files=True)
         elif action == "open_url":
             ok, msg = web.open_url(intent["url"], intent.get("browser"))
+            if ok:
+                msg = f"Opening website: {web.pretty_site(intent['url'])}"
             self._set_status(("Command executed: " if ok else "Error: ") + msg)
         elif action == "open_browser":
             ok, msg = web.open_browser(intent["browser"])
@@ -2118,10 +2120,10 @@ class FileMindApp(ctk.CTk):
             elif rows:
                 self._set_status(f'{len(rows):,} results for "{query}".')
             else:
-                ok, msg = web.search_web(query, "google", None)
-                self._set_status(
-                    ("Command executed: nothing local matched - " if ok
-                     else "Error: ") + msg)
+                # no app, no local file → treat it as a website
+                # (known shortcut / www.<name>.com / Google fallback)
+                ok, msg = web.open_or_search(query)
+                self._set_status(("Command executed: " if ok else "Error: ") + msg)
 
         threading.Thread(target=work, daemon=True).start()
 

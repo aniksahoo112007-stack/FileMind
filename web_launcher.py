@@ -51,17 +51,60 @@ BROWSER_LABELS = {"chrome": "Chrome", "edge": "Edge", "firefox": "Firefox",
                   "brave": "Brave", "default": "your default browser"}
 
 # ---------------------------------------------------------------- sites
+# Known website shortcuts with their correct domains (some are NOT .com, e.g.
+# wikipedia.org, huggingface.co — so we keep an explicit map instead of always
+# guessing ".com").
 SITES = {
+    # search / Google
+    "google": "https://www.google.com",
     "youtube": "https://www.youtube.com",
     "gmail": "https://mail.google.com",
+    "maps": "https://maps.google.com",
+    "drive": "https://drive.google.com",
+    # developer
     "github": "https://github.com",
+    "gitlab": "https://gitlab.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "stack overflow": "https://stackoverflow.com",
+    "vercel": "https://vercel.com",
+    "netlify": "https://www.netlify.com",
+    "kaggle": "https://www.kaggle.com",
+    "huggingface": "https://huggingface.co",
+    "hugging face": "https://huggingface.co",
+    "replit": "https://replit.com",
+    "codepen": "https://codepen.io",
+    "leetcode": "https://leetcode.com",
+    "npm": "https://www.npmjs.com",
+    "pypi": "https://pypi.org",
+    "dockerhub": "https://hub.docker.com",
+    # AI
+    "openai": "https://openai.com",
     "chatgpt": "https://chatgpt.com",
-    "google": "https://www.google.com",
+    "gemini": "https://gemini.google.com",
+    "claude": "https://claude.ai",
+    "perplexity": "https://www.perplexity.ai",
+    "anthropic": "https://www.anthropic.com",
+    # knowledge / reading
+    "wikipedia": "https://www.wikipedia.org",
+    "reddit": "https://www.reddit.com",
+    "medium": "https://medium.com",
+    "quora": "https://www.quora.com",
+    "notion": "https://www.notion.so",
+    # social
     "whatsapp": "https://web.whatsapp.com",
     "whatsapp web": "https://web.whatsapp.com",
     "instagram": "https://www.instagram.com",
     "facebook": "https://www.facebook.com",
+    "twitter": "https://twitter.com",
+    "x": "https://x.com",
     "linkedin": "https://www.linkedin.com",
+    "telegram": "https://web.telegram.org",
+    "pinterest": "https://www.pinterest.com",
+    # media
+    "netflix": "https://www.netflix.com",
+    "primevideo": "https://www.primevideo.com",
+    "hotstar": "https://www.hotstar.com",
+    # shopping
     "amazon": "https://www.amazon.in",
     "flipkart": "https://www.flipkart.com",
 }
@@ -195,4 +238,51 @@ def search_web(query, engine="google", browser=None):
         where = (f" in {BROWSER_LABELS[browser]}"
                  if browser and browser != "default" else "")
         return True, f'Searching {engine.title()} for "{query}"{where}.'
+    return ok, msg
+
+
+# ================================================================ generic sites
+def pretty_site(name_or_url):
+    """A human-friendly site name for status text ('Wikipedia', 'Vercel')."""
+    s = (name_or_url or "").strip()
+    if s.lower().startswith(("http://", "https://")):
+        host = s.split("//", 1)[-1].split("/", 1)[0]
+        if host.lower().startswith("www."):
+            host = host[4:]
+        s = host.split(".")[0]
+    return s[:1].upper() + s[1:] if s else s
+
+
+def guess_site_url(name):
+    """Build a best-guess URL for an unknown single-word site.
+
+    'vercel' -> https://www.vercel.com  ·  returns None for multi-word text."""
+    n = (name or "").lower().strip()
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]*", n):
+        return f"https://www.{n}.com"
+    return None
+
+
+def open_or_search(name, browser=None):
+    """Open a website for a bare name. Read-only, uses webbrowser (no CMD).
+
+    Order:
+      1. known site shortcut (SITES, exact or fuzzy)
+      2. constructed https://www.<name>.com for a single word
+      3. fallback → Google '<name> official website'
+    Returns (ok, friendly_message)."""
+    name = (name or "").strip()
+    if not name:
+        return False, "Nothing to open."
+
+    url = (SITES.get(name.lower()) or match_site(name)
+           or guess_site_url(name))
+    if url:
+        ok, msg = open_url(url, browser)
+        if ok:
+            return True, f"Opening website: {pretty_site(url)}"
+        # browser genuinely failed to launch → fall through to a search
+    ok, msg = search_web(f"{name} official website", "google", browser)
+    if ok:
+        return True, f"Searching for official website: {name}"
     return ok, msg

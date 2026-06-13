@@ -84,6 +84,8 @@ def _correct_token(tok):
     Leaves unknown topic words (like 'python') untouched."""
     if len(tok) < 3 or tok in _EXACT or "." in tok or tok.isdigit():
         return tok
+    if tok in web.SITES:           # never "correct" a known site (openai, vercel…)
+        return tok
     if HAS_RAPIDFUZZ:
         hit = _rf_process.extractOne(tok, VOCAB, score_cutoff=80)
         return hit[0] if hit else tok
