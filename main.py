@@ -25,6 +25,7 @@ import web_launcher as web
 import ai_service
 import lmstudio_client
 import system_monitor
+from activity_memory import ActivityMemory
 from app_scanner import AppScanner
 
 # Optional voice engine: sounddevice (mic) + faster-whisper (transcription).
@@ -232,6 +233,7 @@ class FileMindApp(ctk.CTk):
         self.search      = SearchEngine(self.db)
         self.launcher    = AppLauncher(self.db)
         self.projects    = ProjectRegistry(self.db)
+        self.activity    = ActivityMemory(self.db)   # read-only activity log
 
         try:
             self.voice = VoiceAssistant(
@@ -541,15 +543,15 @@ class FileMindApp(ctk.CTk):
                   padx=(0 if col == 0 else 6, 0))
         parent.grid_columnconfigure(col, weight=1)
 
-        icon  = ctk.CTkLabel(card, text=emoji, font=ctk.CTkFont(size=26))
-        icon.pack(pady=(10, 0))
+        icon  = ctk.CTkLabel(card, text=emoji, font=ctk.CTkFont(size=20))
+        icon.pack(pady=(3, 0))
         value = ctk.CTkLabel(card, text="-",
                              font=ctk.CTkFont(size=20, weight="bold"),
                              text_color=NEON_CYAN)
-        value.pack()
+        value.pack(pady=0)
         cap   = ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=11),
                              text_color="#8090b0")
-        cap.pack(pady=(0, 10))
+        cap.pack(pady=(0, 3))
 
         for widget in (card, icon, value, cap):
             widget.bind("<Button-1>", lambda e: on_click())
@@ -643,70 +645,136 @@ class FileMindApp(ctk.CTk):
                                           NEON_PINK, with_bar=False),
         }
 
-        # ── AI Mission Control (inside the scroll container) ──
+        # ── AI Mission Control (compact 4-column layout) ──
         cc = ctk.CTkFrame(self.dash_scroll, corner_radius=12,
                           fg_color="#12182e",
                           border_width=1, border_color=NEON_PURPLE)
-        cc.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        cc.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         cc.grid_columnconfigure(0, weight=0)   # brain (fixed)
-        cc.grid_columnconfigure(1, weight=1)   # timeline
+        cc.grid_columnconfigure(1, weight=1)   # timeline + recent activity
         cc.grid_columnconfigure(2, weight=1)   # quick actions
+        cc.grid_columnconfigure(3, weight=1)   # file insights
         self._cmd_center = cc
 
         ctk.CTkLabel(cc, text="🛰  AI Mission Control",
                      font=ctk.CTkFont(size=13, weight="bold"),
                      text_color=NEON_CYAN).grid(
-            row=0, column=0, columnspan=3, sticky="w", padx=12, pady=(8, 2))
+            row=0, column=0, columnspan=4, sticky="w", padx=12, pady=(6, 2))
 
         # column 0 — animated AI Brain visualizer + live status
         self._build_brain_visualizer(cc)
 
-        # column 1 — command timeline
-        tl = ctk.CTkFrame(cc, fg_color="transparent")
-        tl.grid(row=1, column=1, sticky="nw", padx=12, pady=(0, 10))
-        ctk.CTkLabel(tl, text="🕓  COMMAND TIMELINE",
+        # column 1 — command timeline + recent activity + resume
+        mid = ctk.CTkFrame(cc, fg_color="transparent")
+        mid.grid(row=1, column=1, sticky="nw", padx=10, pady=(0, 6))
+        ctk.CTkLabel(mid, text="🕓  COMMAND TIMELINE",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#506080").pack(anchor="w")
-        self._cc_timeline_box = ctk.CTkFrame(tl, fg_color="transparent")
+        self._cc_timeline_box = ctk.CTkFrame(mid, fg_color="transparent")
         self._cc_timeline_box.pack(anchor="w", fill="x")
+        arow = ctk.CTkFrame(mid, fg_color="transparent")
+        arow.pack(anchor="w", fill="x", pady=(6, 0))
+        ctk.CTkLabel(arow, text="🕘  RECENT ACTIVITY",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#506080").pack(side="left")
+        ctk.CTkButton(arow, text="▶ Resume", width=84, height=22,
+                      corner_radius=8, fg_color="#1a4a1a",
+                      hover_color="#226622",
+                      font=ctk.CTkFont(size=10, weight="bold"),
+                      command=self.continue_my_work).pack(side="right")
+        self._cc_activity_box = ctk.CTkFrame(mid, fg_color="transparent")
+        self._cc_activity_box.pack(anchor="w", fill="x")
 
-        # column 2 — AI quick actions + file insights
-        acts = ctk.CTkFrame(cc, fg_color="transparent")
-        acts.grid(row=1, column=2, sticky="nw", padx=12, pady=(0, 10))
-        ctk.CTkLabel(acts, text="⚡  AI QUICK ACTIONS",
+        # column 2 — AI quick actions
+        qa = ctk.CTkFrame(cc, fg_color="transparent")
+        qa.grid(row=1, column=2, sticky="nw", padx=10, pady=(0, 6))
+        ctk.CTkLabel(qa, text="⚡  AI QUICK ACTIONS",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#506080").pack(anchor="w")
-        self._cc_actions_box = ctk.CTkFrame(acts, fg_color="transparent")
+        self._cc_actions_box = ctk.CTkFrame(qa, fg_color="transparent")
         self._cc_actions_box.pack(anchor="w", fill="x")
-        ctk.CTkLabel(acts, text="🔎  FILE INSIGHTS",
+
+        # column 3 — file insights (now beside quick actions, same row)
+        fi = ctk.CTkFrame(cc, fg_color="transparent")
+        fi.grid(row=1, column=3, sticky="nw", padx=10, pady=(0, 6))
+        ctk.CTkLabel(fi, text="🔎  FILE INSIGHTS",
                      font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color="#506080").pack(anchor="w", pady=(8, 0))
-        self._cc_insights_box = ctk.CTkFrame(acts, fg_color="transparent")
+                     text_color="#506080").pack(anchor="w")
+        self._cc_insights_box = ctk.CTkFrame(fi, fg_color="transparent")
         self._cc_insights_box.pack(anchor="w", fill="x")
 
         # row 2 — smart project cards
         ctk.CTkLabel(cc, text="📂  SMART PROJECTS",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#506080").grid(
-            row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 0))
+            row=2, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 0))
         self._cc_projects_box = ctk.CTkFrame(cc, fg_color="transparent")
-        self._cc_projects_box.grid(row=3, column=0, columnspan=3,
-                                   sticky="ew", padx=8, pady=(2, 10))
+        self._cc_projects_box.grid(row=3, column=0, columnspan=4,
+                                   sticky="ew", padx=8, pady=(2, 6))
 
-        # row 4 — Voice Assistant panel
+        # row 4/5 — Voice Assistant panel (kept, compact)
         self._build_voice_panel(cc)
 
         # whole scroll container hidden until the Dashboard is active
+
+    def _build_activity_card(self, cc):
+        """Compact Recent-Activity + Continue-My-Work card (rows 6-7 of the
+        scrollable command center — never overflows, scrolls if needed)."""
+        head = ctk.CTkFrame(cc, fg_color="transparent")
+        head.grid(row=6, column=0, columnspan=3, sticky="ew", padx=12,
+                  pady=(2, 0))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="🕘  RECENT ACTIVITY",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#506080").grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            head, text="▶ Resume Last Work", width=150, height=26,
+            corner_radius=8, fg_color="#1a4a1a", hover_color="#226622",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.continue_my_work).grid(row=0, column=1, sticky="e")
+        self._cc_activity_box = ctk.CTkFrame(cc, fg_color="transparent")
+        self._cc_activity_box.grid(row=7, column=0, columnspan=3, sticky="ew",
+                                   padx=8, pady=(2, 10))
+
+    _ACTIVITY_ICONS = {
+        "opened_project": "📂", "opened_folder": "🗂", "opened_file": "📄",
+        "opened_website": "🌐", "opened_app": "🚀", "file_search": "🔍",
+        "ai_search": "🧠", "voice_command": "🎙", "command_run": "⌨",
+    }
+
+    def _refresh_recent_activity(self):
+        box = getattr(self, "_cc_activity_box", None)
+        if box is None:
+            return
+        for w in box.winfo_children():
+            w.destroy()
+        try:
+            acts = self.activity.get_recent_activities(5)
+        except Exception:
+            acts = []
+        if not acts:
+            ctk.CTkLabel(
+                box, text="No activity yet — open a project, file or website.",
+                font=ctk.CTkFont(size=11), text_color="#506080").pack(
+                anchor="w", padx=4)
+            return
+        for a in acts:
+            ts = (a.get("timestamp", "") or "")[11:16]
+            ic = self._ACTIVITY_ICONS.get(a.get("action_type", ""), "•")
+            title = (a.get("title", "") or "")[:36]
+            ctk.CTkLabel(box, text=f"{ic}  [{ts}]  {title}", anchor="w",
+                         font=ctk.CTkFont(size=11),
+                         text_color="#c8d4f0").pack(anchor="w", padx=4, pady=1)
 
     def _build_voice_panel(self, cc):
         ctk.CTkLabel(cc, text="🎙  VOICE ASSISTANT",
                      font=ctk.CTkFont(size=10, weight="bold"),
                      text_color="#506080").grid(
-            row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 0))
+            row=4, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 0))
         box = ctk.CTkFrame(cc, corner_radius=10, fg_color=GLASS_BG,
                            border_width=1, border_color=GLASS_BORDER)
-        box.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8,
-                 pady=(2, 10))
+        box.grid(row=5, column=0, columnspan=4, sticky="ew", padx=8,
+                 pady=(2, 8))
         box.grid_columnconfigure(1, weight=1)
         # mic pulse indicator
         self._voice_mic_lbl = ctk.CTkLabel(
@@ -822,12 +890,12 @@ class FileMindApp(ctk.CTk):
         self.after(130, self._animate_brain)
 
     def _cc_button(self, parent, text, cmd):
-        b = ctk.CTkButton(parent, text=text, anchor="w", height=26,
+        b = ctk.CTkButton(parent, text=text, anchor="w", height=22,
                           corner_radius=8, fg_color=GLASS_BG,
                           hover_color=GLASS_HOVER, border_width=1,
                           border_color=GLASS_BORDER,
                           font=ctk.CTkFont(size=11), command=cmd)
-        b.pack(anchor="w", fill="x", pady=2)
+        b.pack(anchor="w", fill="x", pady=1)
         self._hover_glow(b, GLASS_BORDER, NEON_CYAN)
         return b
 
@@ -865,6 +933,8 @@ class FileMindApp(ctk.CTk):
         on = getattr(self, "_ai_search_mode", False)
         self._cc_aisearch.configure(
             text="AI Search: " + ("On" if on else "Off"))
+
+        self._refresh_recent_activity()
 
         # ── command timeline (last 50 kept in DB; show most recent) ──
         for w in self._cc_timeline_box.winfo_children():
@@ -999,6 +1069,9 @@ class FileMindApp(ctk.CTk):
         try:
             if folder and os.path.isdir(folder):
                 os.startfile(folder)
+                self.activity.log_activity(
+                    "opened_folder", os.path.basename(folder.rstrip("\\/")),
+                    folder)
                 self._set_status(f"Opened folder: {folder}")
             else:
                 self._set_status("Project folder not found.")
@@ -1676,6 +1749,8 @@ class FileMindApp(ctk.CTk):
             path = row.get("path", "")
             try:
                 os.startfile(path)
+                self.activity.log_activity(
+                    "opened_file", row.get("name", path), path)
                 self._set_status(f"Opened: {row.get('name', path)}")
             except Exception as e:
                 self._set_status(f"Error opening file: {e}")
@@ -2080,6 +2155,90 @@ class FileMindApp(ctk.CTk):
             return False
         return os.path.splitext(t)[1].lower() in FileMindApp._FILE_EXT_HINTS
 
+    # ═══════════════════════════════════════════ AI File Detective ═══════════
+    # natural-language → cleaned keywords → existing ranked search.
+    _DETECTIVE_PREFIXES = (
+        "where is my ", "where is the ", "where is ", "where's my ",
+        "where's the ", "where's ", "where are my ", "where are the ",
+        "where are ", "show me my ", "show me the ", "show me ", "show my ",
+        "show the ", "show latest ", "show recent ", "show ",
+        "locate my ", "locate the ", "locate ",
+        "search for my ", "search for the ", "search for ",
+    )
+    # synonym groups → canonical keyword (read-only intent normalisation)
+    _ENTITY_SYNONYMS = (
+        (("aadhaar card", "aadhaar", "adhaar", "adhar card", "adhar"), "aadhar"),
+        (("voter id card", "voter id", "voter card", "election card"), "voter"),
+        (("pan card", "pancard"), "pan"),
+        (("curriculum vitae", "cv"), "resume"),
+        (("certificates", "certs", "cert"), "certificate"),
+        (("study notes",), "notes"),
+        (("invoices",), "invoice"),
+    )
+    # phrases that don't belong in a filename keyword set
+    _DETECTIVE_FILLERS = (" related to ", " regarding ", " about ",
+                          " containing ", " that contains ", " that has ",
+                          " with name ", " named ", " called ", " for me")
+    _DETECTIVE_DROP = {"document", "documents", "file", "files", "the", "a",
+                       "an", "my", "me", "for", "please", "all", "latest",
+                       "recent", "some", "any", "of"}
+
+    def _detective_extract(self, text):
+        """If `text` is a natural 'find/where/show' phrase, return cleaned
+        keywords for ranked search; otherwise None (so normal routing runs)."""
+        low = " ".join((text or "").lower().split())
+        if not low:
+            return None
+        # never hijack the existing 'show downloads' command
+        if low == "show downloads" or low.startswith("show downloads"):
+            return None
+        for pfx in self._DETECTIVE_PREFIXES:
+            if low.startswith(pfx):
+                return self._detective_clean(low[len(pfx):])
+        return None
+
+    def _detective_clean(self, q):
+        import re
+        q = " ".join((q or "").lower().split())
+        if not q:
+            return ""
+        for f in self._DETECTIVE_FILLERS:
+            q = q.replace(f, " ")
+        for variants, canon in self._ENTITY_SYNONYMS:
+            for v in sorted(variants, key=len, reverse=True):
+                q = re.sub(rf"\b{re.escape(v)}\b", canon, q)
+        q = " ".join(w for w in q.split() if w not in self._DETECTIVE_DROP)
+        return q.strip()
+
+    def _detective_search(self, query):
+        """Run the cleaned query through the EXISTING ranked search and show it
+        in the EXISTING results table. Read-only — only searches."""
+        q = (query or "").strip()
+        if not q:
+            self._set_status("🕵️ AI File Detective: what should I look for?")
+            return
+        self.activity.log_activity("file_search", q, "detective")
+        self._set_status(f'🕵️ AI File Detective searching for "{q}"…')
+
+        def work():
+            try:
+                rows = self.search.ranked_search(q, RESULT_LIMIT)
+            except Exception as e:
+                self.after(0, self._set_status, f"Detective error: {e}")
+                return
+            self.after(0, done, rows)
+
+        def done(rows):
+            self._show_search_groups(q, [], rows)   # existing display + table
+            if rows:
+                self._set_status(
+                    f'🕵️ Found {len(rows):,} file(s) for "{q}".  '
+                    f'Best match: {rows[0].get("name", "")}')
+            else:
+                self._set_status(f'🕵️ No files found for "{q}".')
+
+        threading.Thread(target=work, daemon=True).start()
+
     def execute_command(self):
         text = self.search_var.get().strip()
         if not text:
@@ -2099,6 +2258,16 @@ class FileMindApp(ctk.CTk):
         if lower.startswith("find my "):
             self._run_ai_search(text[8:].strip())
             return
+
+        # ── AI File Detective: natural-language file finding ────────────────
+        # ("where is my X", "show my X", "locate X", "search for X", …) → it
+        # normalises the phrase and uses the EXISTING ranked search + table.
+        # Only in normal mode; AI Search mode keeps its own flow untouched.
+        if not self._ai_search_mode:
+            det = self._detective_extract(text)
+            if det is not None:
+                self._detective_search(det)
+                return
 
         # ── understand the command (rule parser → intent) ───────────────────
         try:
@@ -2155,6 +2324,8 @@ class FileMindApp(ctk.CTk):
         elif action == "find_screenshots":
             self.show_screenshots()
             self._set_status("Command executed: showing screenshots.")
+        elif action == "continue_work":
+            self.continue_my_work()
         elif action == "find_files":
             q, ext = intent.get("query", ""), intent.get("extension")
             # fold the extension word back in so it ranks (and tolerates typos)
@@ -2162,18 +2333,31 @@ class FileMindApp(ctk.CTk):
             self._load_async(
                 lambda: self.search.ranked_search(qfull, RESULT_LIMIT),
                 f'Find "{qfull}"', group_as_files=True)
+            self.activity.log_activity("file_search", qfull, "search query")
         elif action == "open_url":
             ok, msg = web.open_url(intent["url"], intent.get("browser"))
             if ok:
                 msg = f"Opening website: {web.pretty_site(intent['url'])}"
+                self.activity.log_activity(
+                    "opened_website", web.pretty_site(intent["url"]),
+                    intent["url"])
             self._set_status(("Command executed: " if ok else "Error: ") + msg)
         elif action == "open_browser":
             ok, msg = web.open_browser(intent["browser"])
+            if ok:
+                self.activity.log_activity(
+                    "opened_website", intent["browser"].title(),
+                    intent["browser"])
             self._set_status(("Command executed: " if ok else "Error: ") + msg)
         elif action == "web_search":
             ok, msg = web.search_web(intent["query"],
                                      intent.get("engine", "google"),
                                      intent.get("browser"))
+            if ok:
+                self.activity.log_activity(
+                    "opened_website",
+                    f'{intent.get("engine", "google").title()}: '
+                    f'{intent["query"]}', intent["query"])
             self._set_status(("Command executed: " if ok else "Error: ") + msg)
         elif action == "open_app":
             self._open_best(intent["name"], prefer_apps=True)
@@ -2194,6 +2378,10 @@ class FileMindApp(ctk.CTk):
                 query, [self._app_to_row(app)] if app else [], rows)
             if app:
                 ok, msg = self.launcher.launch(app)
+                if ok:
+                    self.activity.log_activity(
+                        "opened_app", app.get("name", query),
+                        app.get("path", ""))
                 self._set_status(("Command executed: " if ok else "Error: ") + msg)
             elif rows and prefer_apps:
                 if self.search.open_file(rows[0]["path"]):
@@ -2226,6 +2414,8 @@ class FileMindApp(ctk.CTk):
                 self.show_results(rows)
                 try:
                     os.startfile(rows[0]["path"])
+                    self.activity.log_activity(
+                        "opened_folder", rows[0]["name"], rows[0]["path"])
                     self._set_status(
                         f"Command executed: opened {rows[0]['path']}")
                 except Exception as e:
@@ -2731,6 +2921,7 @@ class FileMindApp(ctk.CTk):
             return
 
         info = self._ai_understand(query)
+        self.activity.log_activity("ai_search", query, "ai search")
         self._brain_busy = True
         self._set_brain_state("Searching")          # brain pulses while busy
         if self._ai_search_mode:
@@ -3168,6 +3359,10 @@ class FileMindApp(ctk.CTk):
         project = self.projects.best(name)
         if project:
             ok, msg = self.projects.open_project(project)
+            if ok:
+                self.activity.log_activity(
+                    "opened_project", project.get("name", name),
+                    project.get("folder", ""))
             self._set_status(("Command executed: " if ok else "Error: ") + msg)
             self.show_results([self._project_to_row(project)])
         else:
@@ -3175,6 +3370,106 @@ class FileMindApp(ctk.CTk):
                 f'No project named "{name}" - searching instead. '
                 "(Use 'Add Project' to register it.)")
             self._open_best(name, prefer_apps=True)
+
+    # ── Continue My Work ──────────────────────────────────────────────────────
+    _RESUME_KINDS = {
+        "opened_project": "📂 Project", "opened_folder": "🗂 Folder",
+        "opened_file": "📄 File", "opened_website": "🌐 Website",
+        "opened_app": "🚀 App",
+    }
+
+    def continue_my_work(self):
+        """Find the last meaningful activity and offer to resume it."""
+        act = self.activity.get_last_work_activity()
+        if not act:
+            self._set_status("No previous work session found.")
+            try:
+                messagebox.showinfo(config.APP_NAME,
+                                    "No previous work session found.")
+            except Exception:
+                pass
+            return
+        self._show_resume_popup(act)
+
+    def _show_resume_popup(self, act):
+        kind = self._RESUME_KINDS.get(act.get("action_type", ""),
+                                      act.get("action_type", ""))
+        title = act.get("title", "")
+        target = act.get("target", "")
+        ts = act.get("timestamp", "")
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Continue My Work")
+        dlg.geometry("470x240")
+        dlg.resizable(False, False)
+        dlg.configure(fg_color="#141c2e")
+        dlg.grab_set()
+        dlg.lift()
+        ctk.CTkLabel(dlg, text="▶  Resume last work?",
+                     font=ctk.CTkFont(size=15, weight="bold"),
+                     text_color=NEON_CYAN).pack(pady=(18, 8), padx=20)
+        ctk.CTkLabel(dlg, text=f"{kind}:   {title}",
+                     font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color="#c8d4f0", wraplength=420).pack(padx=20)
+        ctk.CTkLabel(dlg, text=target, font=ctk.CTkFont(size=10),
+                     text_color="#607090", wraplength=420,
+                     justify="left").pack(padx=20, pady=(2, 0))
+        ctk.CTkLabel(dlg, text=f"Last opened:  {ts}",
+                     font=ctk.CTkFont(size=10),
+                     text_color="#8090b0").pack(padx=20, pady=(2, 10))
+        row = ctk.CTkFrame(dlg, fg_color="transparent")
+        row.pack(pady=(4, 0))
+
+        def do_resume():
+            dlg.destroy()
+            self._resume_activity(act)
+
+        ctk.CTkButton(row, text="▶ Resume", width=120,
+                      fg_color="#1a4a1a", hover_color="#226622",
+                      command=do_resume).pack(side="left", padx=8)
+        ctk.CTkButton(row, text="✖ Cancel", width=120,
+                      fg_color="#3a1a1a", hover_color="#662222",
+                      command=dlg.destroy).pack(side="left", padx=8)
+
+    def _resume_activity(self, act):
+        """Re-open the remembered item. READ-ONLY: only opens, never modifies."""
+        action_type = act.get("action_type", "")
+        title = act.get("title", "")
+        target = act.get("target", "")
+        # defensive safety gate (activities are read-only opens, but be sure)
+        if any(w in (title + " " + target).lower() for w in
+               ("delete", "move", "rename", "remove", "format", "uninstall")):
+            self._set_status("Blocked by read-only safety mode.")
+            return
+        try:
+            if action_type == "opened_project":
+                self._open_project(title)
+            elif action_type == "opened_folder":
+                if target and os.path.isdir(target):
+                    self.explore(target)
+                else:
+                    self._set_status("That folder no longer exists.")
+            elif action_type == "opened_file":
+                if target and os.path.isfile(target):
+                    os.startfile(target)
+                    self.activity.log_activity("opened_file", title, target)
+                    self._set_status(f"Resumed file: {title}")
+                else:
+                    self._set_status("That file no longer exists.")
+            elif action_type == "opened_website":
+                if target.startswith("http"):
+                    ok, msg = web.open_url(target)
+                elif target.lower() in ("chrome", "edge", "firefox",
+                                        "brave", "default"):
+                    ok, msg = web.open_browser(target.lower())
+                else:
+                    ok, msg = web.search_web(target, "google", None)
+                self._set_status(("Resumed: " if ok else "Error: ") + msg)
+            elif action_type == "opened_app":
+                self._open_best(title, prefer_apps=True)
+            else:
+                self._set_status("Nothing to resume.")
+        except Exception as e:
+            self._set_status(f"Could not resume: {e}")
 
     def add_project_dialog(self):
         name_dlg = ctk.CTkInputDialog(
@@ -3841,6 +4136,9 @@ class FileMindApp(ctk.CTk):
             self._voice_suggestions(out, targets)
 
     def _voice_confidence(self, cmd):
+        # AI File Detective phrases ("where is my…", "show my…") execute directly
+        if self._detective_extract(cmd) is not None:
+            return "high"
         try:
             act = parse(cmd)["action"]
         except Exception:
@@ -3848,7 +4146,7 @@ class FileMindApp(ctk.CTk):
         good = ("open_browser", "open_app", "open_url", "web_search",
                 "open_project", "find_files", "open_downloads",
                 "find_screenshots", "play_game", "remember_project",
-                "open_folder", "intent", "show_downloads")
+                "open_folder", "intent", "show_downloads", "continue_work")
         return "high" if act in good else "low"
 
     def _voice_suggestions(self, cmd, targets):
@@ -3881,6 +4179,7 @@ class FileMindApp(ctk.CTk):
     def _voice_execute(self, cmd):
         self._set_voice_state("EXECUTING", cmd)
         self._voice_clear_confirm()
+        self.activity.log_activity("voice_command", cmd, "corrected command")
         try:
             if cmd == "__projects__":
                 self.switch_view("Projects")
@@ -4019,6 +4318,10 @@ class FileMindApp(ctk.CTk):
         t = " ".join((raw or "").lower().split())
         if not t:
             return t
+        # Continue My Work (English + Hinglish)
+        if ("kaam" in t or "last work" in t
+                or (("continue" in t or "resume" in t) and "work" in t)):
+            return "continue my work"
         t = (t.replace("you tube", "youtube").replace("v s code", "vscode")
              .replace("vs code", "vscode").replace("git hub", "github")
              .replace("get hub", "github"))

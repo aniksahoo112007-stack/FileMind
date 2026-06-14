@@ -220,6 +220,16 @@ def parse(text):
             if name:
                 return {"action": "remember_project", "name": name}
 
+    # ---------------- continue / resume my work ----------------
+    # Must come BEFORE projects, else "continue my work" → open_project.
+    if (low in ("continue my work", "resume my work", "continue last work",
+                "resume last work", "resume last session", "continue work",
+                "resume work", "continue session", "resume session",
+                "last work", "continue my last work", "resume my last work")
+            or (tokens[0] in ("continue", "resume")
+                and ("work" in tokens or "session" in tokens))):
+        return {"action": "continue_work"}
+
     # ---------------- projects ----------------
     # "open my pos project", "continue filemind", "open project jarvis"
     if (low.startswith(("continue ", "resume "))

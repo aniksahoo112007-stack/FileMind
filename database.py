@@ -85,6 +85,16 @@ CREATE TABLE IF NOT EXISTS document_chunks (
     embedding TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(doc_id);
+
+CREATE TABLE IF NOT EXISTS activity_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    title       TEXT DEFAULT '',
+    target      TEXT DEFAULT '',
+    extra_json  TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_activity_time ON activity_history(id);
 """
 
 SELECT_COLS = """name, path, folder, extension, size,
@@ -273,6 +283,37 @@ class Database:
         return self.query(
             "SELECT command, action, ran_at FROM command_history "
             "ORDER BY id DESC LIMIT ?", (limit,))
+
+    # ------------------------------------------------------------ activity
+    def add_activity(self, action_type, title, target, extra_json=""):
+        """Append one read-only activity; keep only the latest 500 rows."""
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO activity_history "
+                "(timestamp, action_type, title, target, extra_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ts, action_type, title or "", target or "", extra_json or ""))
+            con.execute(
+                """DELETE FROM activity_history WHERE id NOT IN
+                   (SELECT id FROM activity_history ORDER BY id DESC LIMIT 500)""")
+
+    def recent_activities(self, limit=5):
+        return self.query(
+            "SELECT id, timestamp, action_type, title, target, extra_json "
+            "FROM activity_history ORDER BY id DESC LIMIT ?", (limit,))
+
+    def last_activity_of_types(self, action_types):
+        """Most recent activity whose action_type is in `action_types`."""
+        if not action_types:
+            return None
+        ph = ",".join("?" * len(action_types))
+        rows = self.query(
+            "SELECT id, timestamp, action_type, title, target, extra_json "
+            f"FROM activity_history WHERE action_type IN ({ph}) "
+            "ORDER BY id DESC LIMIT 1", tuple(action_types))
+        return rows[0] if rows else None
 
     # ------------------------------------------------------------ dashboard
     def recent_count(self, days=7):
