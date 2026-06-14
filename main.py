@@ -26,6 +26,30 @@ import ai_service
 import lmstudio_client
 import system_monitor
 from app_scanner import AppScanner
+
+# Optional voice engine: sounddevice (mic) + faster-whisper (transcription).
+# No PyAudio, no SpeechRecognition. Degrades gracefully if missing.
+try:
+    import sounddevice as _sd
+    import numpy as _np
+    HAS_SD = True
+except Exception:
+    _sd = None
+    _np = None
+    HAS_SD = False
+
+try:
+    from faster_whisper import WhisperModel as _WhisperModel
+    HAS_WHISPER = True
+except Exception:
+    _WhisperModel = None
+    HAS_WHISPER = False
+
+HAS_VOICE = HAS_SD and HAS_WHISPER
+_VOICE_SAMPLE_RATE = 16000
+_VOICE_SECONDS = 5
+_VOICE_INSTALL_MSG = ("Install voice packages:\n"
+                      "pip install sounddevice scipy faster-whisper")
 from command_parser import parse, COMMAND_HELP
 from database import Database
 from document_indexer import DocumentIndexer
@@ -248,6 +272,10 @@ class FileMindApp(ctk.CTk):
         self._resize_job = None        # debounce handle for window resize/move
         self._header_job = None        # debounce handle for header redraw
         self._is_resizing = False      # True while the window is being dragged
+        self._voice_active = False     # True while a voice session is running
+        self._voice_state = "IDLE"     # IDLE/ACTIVATING/LISTENING/…
+        self._voice_pulse_on = False
+        self._whisper_model = None     # faster-whisper model (lazy-loaded)
         self._build_sidebar()
         self._build_main_area()
         self.sync_ai_mode_ui()       # start in a known, synced OFF state
@@ -324,8 +352,8 @@ class FileMindApp(ctk.CTk):
         self.app_scan_btn  = btn("🚀 Scan Apps",    self.start_app_scan)
         self.game_scan_btn = btn("🎮 Scan Games",   self.start_game_scan)
         btn("➕ Add Project", self.add_project_dialog)
-        btn("🎤 Voice",       self.voice_command,
-            fg_color="#7a3db8", hover_color="#5e2f8e")
+        self._voice_btn = btn("🎤 Voice", self.voice_command,
+                              fg_color="#7a3db8", hover_color="#5e2f8e")
 
         self._sep(sb)
 
@@ -665,7 +693,46 @@ class FileMindApp(ctk.CTk):
         self._cc_projects_box.grid(row=3, column=0, columnspan=3,
                                    sticky="ew", padx=8, pady=(2, 10))
 
+        # row 4 — Voice Assistant panel
+        self._build_voice_panel(cc)
+
         # whole scroll container hidden until the Dashboard is active
+
+    def _build_voice_panel(self, cc):
+        ctk.CTkLabel(cc, text="🎙  VOICE ASSISTANT",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     text_color="#506080").grid(
+            row=4, column=0, columnspan=3, sticky="w", padx=12, pady=(0, 0))
+        box = ctk.CTkFrame(cc, corner_radius=10, fg_color=GLASS_BG,
+                           border_width=1, border_color=GLASS_BORDER)
+        box.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8,
+                 pady=(2, 10))
+        box.grid_columnconfigure(1, weight=1)
+        # mic pulse indicator
+        self._voice_mic_lbl = ctk.CTkLabel(
+            box, text="🎤", font=ctk.CTkFont(size=22), text_color="#5a6680")
+        self._voice_mic_lbl.grid(row=0, column=0, rowspan=2, padx=(12, 8),
+                                 pady=8)
+        self._voice_state_lbl = ctk.CTkLabel(
+            box, text="🎤 Voice Off",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color="#8090b0",
+            anchor="w")
+        self._voice_state_lbl.grid(row=0, column=1, sticky="w", pady=(8, 0))
+        self._voice_detail_lbl = ctk.CTkLabel(
+            box, text="Click 🎤 Voice to start (push-to-talk).",
+            font=ctk.CTkFont(size=11), text_color="#607090",
+            anchor="w", justify="left", wraplength=520)
+        self._voice_detail_lbl.grid(row=1, column=1, sticky="w", pady=(0, 8))
+        self._voice_heard_lbl = ctk.CTkLabel(
+            box, text="", font=ctk.CTkFont(size=11), text_color="#c8d4f0",
+            anchor="w", justify="left", wraplength=620)
+        self._voice_heard_lbl.grid(row=2, column=0, columnspan=2, sticky="w",
+                                   padx=12)
+        self._voice_exec_lbl = ctk.CTkLabel(
+            box, text="", font=ctk.CTkFont(size=11), text_color=NEON_GREEN,
+            anchor="w", justify="left", wraplength=620)
+        self._voice_exec_lbl.grid(row=3, column=0, columnspan=2, sticky="w",
+                                  padx=12, pady=(0, 8))
 
     # ── animated AI Brain visualizer ─────────────────────────────────────────
     _BRAIN_STATES = {
@@ -1018,6 +1085,21 @@ class FileMindApp(ctk.CTk):
         except Exception:
             pass   # a sensor hiccup must never crash the UI
 
+    @staticmethod
+    def _human_speed(bps):
+        """Bytes/sec → clean 'X.XX KB/s' / 'MB/s' / 'GB/s' (never huge raw)."""
+        try:
+            b = float(bps or 0)
+        except Exception:
+            b = 0.0
+        kb = b / 1024.0
+        if kb < 1024:
+            return f"{kb:.2f} KB/s"
+        mb = kb / 1024.0
+        if mb < 1024:
+            return f"{mb:.2f} MB/s"
+        return f"{mb / 1024.0:.2f} GB/s"
+
     def _apply_net_speed(self, ns):
         down = self._metrics.get("net_down")
         up = self._metrics.get("net_up")
@@ -1027,9 +1109,9 @@ class FileMindApp(ctk.CTk):
                     m["value"].configure(text="—")
             return
         if down:
-            down["value"].configure(text=f"{human_size(ns.get('down', 0))}/s")
+            down["value"].configure(text=self._human_speed(ns.get("down", 0)))
         if up:
-            up["value"].configure(text=f"{human_size(ns.get('up', 0))}/s")
+            up["value"].configure(text=self._human_speed(ns.get("up", 0)))
 
     def _apply_cpu(self, raw, cores, temp=None):
         """Smoothed, Task-Manager-like CPU %.
@@ -1214,11 +1296,11 @@ class FileMindApp(ctk.CTk):
             fg_color=ACCENT, hover_color="#3a4db0",
             command=self.execute_command,
         ).grid(row=0, column=1, padx=(0, 8))
-        ctk.CTkButton(
+        self._voice_icon_btn = ctk.CTkButton(
             bar, text="🎤", width=48, height=46, corner_radius=14,
             fg_color="#7a3db8", hover_color="#5e2f8e",
-            command=self.voice_command,
-        ).grid(row=0, column=2)
+            command=self.voice_command)
+        self._voice_icon_btn.grid(row=0, column=2)
 
         # ── suggestion panel ─────────────────────────────────────────────────
         self.suggest_frame = ctk.CTkFrame(
@@ -1387,6 +1469,9 @@ class FileMindApp(ctk.CTk):
 
         # ── AI Search panel (replaces the table when AI Search is ON) ─────────
         self._build_ai_panel(main)
+
+        # ── dedicated Voice Assistant page (replaces centre while recording) ──
+        self._build_voice_page(main)
 
         # ── action bar ───────────────────────────────────────────────────────
         actions = ctk.CTkFrame(main, fg_color="transparent")
@@ -1645,6 +1730,11 @@ class FileMindApp(ctk.CTk):
     def switch_view(self, name):
         # navigating to any normal view always leaves AI Search mode
         self._leave_ai_mode()
+        # and closes the Voice page if it is open (no stuck overlay)
+        if getattr(self, "_voice_page", None) is not None:
+            self._voice_active = False
+            self._voice_orb_on = False
+            self._voice_page.grid_remove()
         self.current_view = name
         # record the user's chosen mode (resize/<Configure> never touches this)
         self._last_user_mode = (
@@ -2067,16 +2157,11 @@ class FileMindApp(ctk.CTk):
             self._set_status("Command executed: showing screenshots.")
         elif action == "find_files":
             q, ext = intent.get("query", ""), intent.get("extension")
-            if ext:
-                self._load_async(
-                    lambda: self.search.search(
-                        name=q or None, extension=ext, limit=RESULT_LIMIT),
-                    f'Find "{(q + " " if q else "")}{ext}"',
-                    group_as_files=True)
-            else:
-                self._load_async(
-                    lambda: self.search.quick_search(q, RESULT_LIMIT),
-                    f'Find "{q}"', group_as_files=True)
+            # fold the extension word back in so it ranks (and tolerates typos)
+            qfull = (q + " " + ext.lstrip(".")).strip() if ext else (q or "")
+            self._load_async(
+                lambda: self.search.ranked_search(qfull, RESULT_LIMIT),
+                f'Find "{qfull}"', group_as_files=True)
         elif action == "open_url":
             ok, msg = web.open_url(intent["url"], intent.get("browser"))
             if ok:
@@ -2315,6 +2400,10 @@ class FileMindApp(ctk.CTk):
         This makes it impossible for a resize / monitor move to open it."""
         if not self._ai_search_mode:
             return
+        if getattr(self, "_voice_page", None) is not None:
+            self._voice_active = False
+            self._voice_orb_on = False
+            self._voice_page.grid_remove()
         for name in ("cards_frame", "quick_frame", "explorer_bar"):
             w = getattr(self, name, None)
             if w is not None:
@@ -3153,6 +3242,8 @@ class FileMindApp(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     def _show_search_groups(self, query, app_rows, file_rows):
+        print(f"[search] returned {len(file_rows)} files, "
+              f"{len(app_rows)} apps for {query!r}")
         folders = [r for r in file_rows
                    if r["file_type"] == config.FOLDER_CATEGORY]
         files   = [r for r in file_rows
@@ -3230,17 +3321,36 @@ class FileMindApp(ctk.CTk):
         return iid
 
     def _reveal_table(self):
-        """Make sure the file table is visible (used when results load while
-        the Dashboard scroll page is showing). No-op in AI mode."""
+        """Bring the file table to the front, swapping out WHATEVER non-table
+        overlay is currently mapped (dashboard scroll page OR the Voice page).
+        This is what lets results from the dashboard AND from voice show up.
+        No-op in AI Search mode (the AI panel owns the centre)."""
         if self._ai_search_mode:
             return
-        if getattr(self, "dash_scroll", None) is not None \
-                and self.dash_scroll.winfo_ismapped():
-            self.dash_scroll.grid_remove()
-            if hasattr(self, "_table_frame"):
-                self._table_frame.grid()
-            if hasattr(self, "_preview_panel"):
-                self._preview_panel.grid()
+        for overlay in ("dash_scroll", "_voice_page"):
+            w = getattr(self, overlay, None)
+            if w is not None and w.winfo_ismapped():
+                w.grid_remove()
+        if getattr(self, "_voice_page", None) is not None:
+            self._voice_orb_on = False
+        if hasattr(self, "_table_frame"):
+            self._table_frame.grid()
+        if hasattr(self, "_preview_panel"):
+            self._preview_panel.grid()
+
+    def _autoselect_first(self):
+        """Select + preview the first real (non-header) row, if any."""
+        for iid in self.tree.get_children():
+            row = self._rows_by_id.get(iid)
+            if row:
+                try:
+                    self.tree.selection_set(iid)
+                    self.tree.focus(iid)
+                    self.tree.see(iid)
+                    self._show_preview(row)
+                except Exception:
+                    pass
+                return
 
     def show_results(self, rows, message=""):
         self._reveal_table()
@@ -3250,6 +3360,8 @@ class FileMindApp(ctk.CTk):
         self._reset_preview()
         for row in rows:
             self._insert_row(row)
+        print(f"[render] show_results: {len(rows)} rows rendered")
+        self._autoselect_first()
         if message:
             self._set_status(message)
 
@@ -3259,6 +3371,7 @@ class FileMindApp(ctk.CTk):
         self._rows_by_id.clear()
         self._current_rows = [r for _, rows in sections for r in rows]
         self._reset_preview()
+        rendered = 0
         for label, rows in sections:
             if not rows:
                 continue
@@ -3267,6 +3380,10 @@ class FileMindApp(ctk.CTk):
             self._rows_by_id[hid] = None
             for row in rows:
                 self._insert_row(row)
+                rendered += 1
+        print(f"[render] show_grouped: {rendered} rows rendered "
+              f"in {len(sections)} group(s)")
+        self._autoselect_first()
 
     def sort_by(self, col):
         keymap = {"name": "name", "type": "file_type",
@@ -3437,14 +3554,496 @@ class FileMindApp(ctk.CTk):
             self._set_status("Downloads folder was not found on this computer.")
 
     # voice
+    # ═══════════════════════════════════════════════ voice assistant ═════════
+    _VOICE_DANGER = ("delete", "remove", "erase", "move", "rename", "format",
+                     "uninstall", "wipe", "destroy", "trash")
+
+    # phonetic / mis-hearing fixes applied before fuzzy correction
+    _VOICE_PHRASE_FIXES = [
+        (r"\b(u dub|you dub|u tube|yu tube|ya tube|you tube|utube|yu tub)\b",
+         "youtube"),
+        (r"\b(youtub|yutub|yootube|yu tube)\b", "youtube"),
+        (r"\b(vs coat|v s code|vs code|visual studio coat|visual studio code|"
+         r"vscoat|vs cod)\b", "vscode"),
+        (r"\b(get hub|git hub|gethub)\b", "github"),
+        (r"\b(ka gal|kaagal|kagal|ka girl|cargill)\b", "kaggle"),
+        (r"\b(grown|chrom|krome|crow)\b", "chrome"),
+        (r"\b(file mine|file mind|filemine)\b", "filemind"),
+        (r"\b(paws app|pause app|paws|pause)\b", "pos"),
+        (r"\b(ope|opn|opan|oppen|opem)\b", "open"),
+        (r"\b(serch|surch|searc)\b", "search"),
+        (r"\b(continu|kontinue|continew)\b", "continue"),
+        (r"\b(downlod|download|down load)\b", "downloads"),
+    ]
+    _VOICE_VERBS = {"open", "launch", "start", "run", "search", "find",
+                    "continue", "resume", "play", "show", "downloads"}
+
+    # ── dedicated futuristic Voice page (swaps into the centre while active) ──
+    def _build_voice_page(self, parent):
+        page = ctk.CTkFrame(parent, corner_radius=14, fg_color="#0d1424",
+                            border_width=1, border_color=NEON_PURPLE)
+        page.grid(row=7, column=0, columnspan=2, sticky="nsew")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_rowconfigure(3, weight=1)
+        page.grid_remove()
+        self._voice_page = page
+        self._voice_orb_on = False
+
+        head = ctk.CTkFrame(page, fg_color="transparent")
+        head.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 2))
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="🎙  Voice Assistant",
+                     font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=NEON_CYAN).grid(row=0, column=0, sticky="w")
+        self._vp_model = ctk.CTkLabel(head, text="", font=ctk.CTkFont(size=10),
+                                      text_color="#607090")
+        self._vp_model.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        ctk.CTkButton(head, text="✕ Close", width=90, height=28,
+                      corner_radius=8, fg_color="#2a0a1a",
+                      hover_color="#4a1030",
+                      command=self._voice_cancel).grid(row=0, column=2,
+                                                       sticky="e")
+
+        self._vp_orb = tk.Canvas(page, width=150, height=150, bg="#0d1424",
+                                 highlightthickness=0, bd=0)
+        self._vp_orb.grid(row=1, column=0, pady=(6, 0))
+        self._vp_state = ctk.CTkLabel(
+            page, text="🎤 Ready", font=ctk.CTkFont(size=16, weight="bold"),
+            text_color=NEON_GREEN)
+        self._vp_state.grid(row=2, column=0)
+
+        body = ctk.CTkScrollableFrame(page, fg_color="transparent")
+        body.grid(row=3, column=0, sticky="nsew", padx=14, pady=(4, 10))
+        body.grid_columnconfigure(0, weight=1)
+        self._vp_raw = ctk.CTkLabel(
+            body, text="Raw heard: —", anchor="w", justify="left",
+            font=ctk.CTkFont(size=12), text_color="#c8d4f0", wraplength=620)
+        self._vp_raw.grid(row=0, column=0, sticky="w", pady=2)
+        self._vp_corrected = ctk.CTkLabel(
+            body, text="Corrected command: —", anchor="w", justify="left",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color=NEON_GREEN,
+            wraplength=620)
+        self._vp_corrected.grid(row=1, column=0, sticky="w", pady=2)
+        self._vp_conf = ctk.CTkLabel(body, text="", anchor="w",
+                                     font=ctk.CTkFont(size=12, weight="bold"))
+        self._vp_conf.grid(row=2, column=0, sticky="w", pady=2)
+        self._vp_sugg_box = ctk.CTkFrame(body, fg_color="transparent")
+        self._vp_sugg_box.grid(row=3, column=0, sticky="ew", pady=2)
+        self._vp_confirm_box = ctk.CTkFrame(body, fg_color="transparent")
+        self._vp_confirm_box.grid(row=4, column=0, sticky="ew", pady=2)
+        ctk.CTkLabel(
+            body, justify="left", anchor="w",
+            font=ctk.CTkFont(size=11), text_color="#6070a0",
+            text=("Try saying:\n"
+                  "  • open chrome        • open youtube and search python\n"
+                  "  • open project pos app    • continue filemind\n"
+                  "  • find voter pdf      • downloads kholo")
+        ).grid(row=5, column=0, sticky="w", pady=(8, 2))
+
+    def _open_voice_page(self):
+        for f in ("_table_frame", "dash_scroll", "_ai_panel", "_preview_panel"):
+            w = getattr(self, f, None)
+            if w is not None:
+                w.grid_remove()
+        if hasattr(self, "_voice_page"):
+            self._voice_page.grid()
+        self._voice_clear_confirm()
+        self._voice_orb_on = True
+        self._voice_orb()
+
+    def _close_voice_page(self):
+        self._voice_orb_on = False
+        page = getattr(self, "_voice_page", None)
+        # If the Voice page is already gone, the result table (or another view)
+        # has taken over — do NOT clobber it by restoring the dashboard.
+        if page is None or not page.winfo_ismapped():
+            return
+        page.grid_remove()
+        # restore the correct central content (visibility only — no rebuild)
+        if self._ai_search_mode and hasattr(self, "_ai_panel"):
+            self._ai_panel.grid()
+        elif self.current_view == "Dashboard" and hasattr(self, "dash_scroll"):
+            self.dash_scroll.grid()
+        else:
+            if hasattr(self, "_table_frame"):
+                self._table_frame.grid()
+            if hasattr(self, "_preview_panel"):
+                self._preview_panel.grid()
+
+    def _voice_orb(self):
+        c = getattr(self, "_vp_orb", None)
+        if c is None or not getattr(self, "_voice_orb_on", False):
+            return
+        import math
+        self._vp_phase = getattr(self, "_vp_phase", 0) + 1
+        state = self._voice_state
+        color = {"LISTENING": NEON_GREEN, "HEARING": NEON_CYAN,
+                 "PROCESSING": NEON_PURPLE, "EXECUTING": NEON_ORANGE,
+                 "DONE": NEON_GREEN, "ERROR": NEON_ORANGE,
+                 "CONFUSED": NEON_ORANGE,
+                 "ACTIVATING": NEON_CYAN}.get(state, "#5a6680")
+        busy = state in ("LISTENING", "HEARING", "PROCESSING", "ACTIVATING")
+        speed = 0.5 if busy else 0.18
+        cx, cy = 75, 75
+        c.delete("all")
+        for i, base in enumerate((52, 40, 28, 16)):
+            amp = 6 if busy else 2
+            r = base + amp * math.sin(self._vp_phase * speed - i * 0.6)
+            c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          outline=color, width=2)
+        c.create_text(cx, cy, text="🎤", font=("Segoe UI", 28))
+        self.after(150, self._voice_orb)
+
+    # ── flow ─────────────────────────────────────────────────────────────────
     def voice_command(self):
+        """Toggle push-to-talk voice. Opens the dedicated Voice page."""
+        if self._voice_active:
+            self._voice_cancel()
+            return
+        self._open_voice_page()
+        self._voice_show_transcript("", "", None)
+        self._voice_clear_confirm()
+        if not HAS_VOICE:
+            self._set_voice_state("ERROR", "")
+            if hasattr(self, "_vp_corrected"):
+                self._vp_corrected.configure(text=_VOICE_INSTALL_MSG)
+            return
+        self._voice_active = True
+        self._set_voice_state("ACTIVATING", "Initializing microphone…")
+        threading.Thread(target=self._voice_worker, daemon=True).start()
+
+    def _get_whisper_model(self):
+        """Lazy-load faster-whisper ONCE (small → base fallback, CPU int8)."""
+        if self._whisper_model is None:
+            for size in ("small", "base"):
+                try:
+                    self._whisper_model = _WhisperModel(
+                        size, device="cpu", compute_type="int8")
+                    self._whisper_size = size
+                    break
+                except Exception:
+                    continue
+            if self._whisper_model is None:
+                raise RuntimeError("Whisper model could not be loaded.")
+            self.after(0, lambda: hasattr(self, "_vp_model") and
+                       self._vp_model.configure(
+                           text=f"Whisper '{self._whisper_size}' loaded"))
+        return self._whisper_model
+
+    def _record_audio(self):
+        """Record ~6 s, normalise volume, amplify quiet audio, trim silence."""
         try:
-            if self.voice is None:
-                self._set_status("Voice module unavailable")
-                return
-            self.voice.listen_once()
+            frames = _sd.rec(int(6 * _VOICE_SAMPLE_RATE),
+                             samplerate=_VOICE_SAMPLE_RATE,
+                             channels=1, dtype="float32")
+            _sd.wait()
         except Exception:
-            self._set_status("Voice module unavailable")
+            return None
+        audio = _np.squeeze(frames).astype("float32")
+        if audio.size == 0:
+            return audio
+        peak = float(_np.max(_np.abs(audio)))
+        if peak > 1e-4:                       # amplify quiet audio (cap gain ×8)
+            audio = audio * min(0.95 / peak, 8.0)
+        thr = 0.02                            # trim leading/trailing silence
+        idx = _np.where(_np.abs(audio) > thr)[0]
+        if idx.size:
+            pad = _VOICE_SAMPLE_RATE // 10
+            audio = audio[max(0, idx[0] - pad): min(audio.size, idx[-1] + pad)]
+        return audio
+
+    def _voice_worker(self):
+        """Record + transcribe off-thread. Never blocks the mainloop."""
+        try:
+            self.after(0, self._set_voice_state, "LISTENING", "Speak now…")
+            audio = self._record_audio()
+            if audio is None:
+                self.after(0, self._voice_fail, "Microphone not detected")
+                return
+            self.after(0, self._set_voice_state, "HEARING", "")
+            self.after(0, self._set_voice_state,
+                       "PROCESSING", "Transcribing with Whisper…")
+            try:
+                model = self._get_whisper_model()
+            except Exception as e:
+                self.after(0, self._voice_fail, f"Whisper load failed: {e}")
+                return
+            try:
+                kw = dict(beam_size=5, best_of=5, temperature=0, language="en")
+                try:
+                    segments, _i = model.transcribe(audio, vad_filter=True, **kw)
+                except TypeError:           # older faster-whisper: no vad_filter
+                    segments, _i = model.transcribe(audio, **kw)
+                text = " ".join(s.text for s in segments).strip()
+            except Exception as e:
+                self.after(0, self._voice_fail, f"Transcription failed: {e}")
+                return
+            if not text:
+                self.after(0, self._voice_fail,
+                           "Could not hear clearly. Try again.")
+                return
+            self.after(0, self._voice_heard, text)
+        except Exception as e:
+            self.after(0, self._voice_fail, f"Voice error: {e}")
+
+    # ── correction + intent (Parts D / E) ────────────────────────────────────
+    def _voice_targets(self):
+        targets = {"chrome", "edge", "firefox", "brave", "vscode", "notepad",
+                   "downloads", "youtube", "google", "github"}
+        try:
+            targets.update(web.SITES.keys())
+        except Exception:
+            pass
+        try:
+            for p in self.projects.all():
+                nm = (p.get("name", "") or "").lower()
+                if nm:
+                    targets.add(nm)
+        except Exception:
+            pass
+        return [t for t in targets if t]
+
+    def _voice_correct(self, raw):
+        """Fuzzy-correct a raw transcript → (command, confidence, suggestions)."""
+        import re
+        import difflib
+        t = " ".join((raw or "").lower().split())
+        t = " ".join(re.sub(r"[^a-z0-9\s]", " ", t).split())
+        if not t:
+            return "", "low", []
+        for pat, rep in self._VOICE_PHRASE_FIXES:
+            t = re.sub(pat, rep, t)
+        t = " ".join(t.split())
+        t = self._normalize_voice(t)            # Hinglish (kholo, …)
+        if t == "__projects__":
+            return t, "high", []
+
+        targets = self._voice_targets()
+        toks = t.split()
+        # fix the verb (first token)
+        if toks and toks[0] not in self._VOICE_VERBS:
+            m = difflib.get_close_matches(
+                toks[0], list(self._VOICE_VERBS), n=1, cutoff=0.7)
+            if m:
+                toks[0] = m[0]
+        # fix a single target after open/launch/continue/… (not "X and search Y")
+        if (len(toks) >= 2 and toks[0] in
+                ("open", "launch", "start", "continue", "resume", "play")
+                and "and" not in toks and "search" not in toks
+                and "project" not in toks):
+            tail = " ".join(toks[1:])
+            if tail not in targets:
+                m = difflib.get_close_matches(tail, targets, n=1, cutoff=0.6)
+                if m:
+                    toks = [toks[0], m[0]]
+        out = " ".join(toks).strip()
+        return out, self._voice_confidence(out), \
+            self._voice_suggestions(out, targets)
+
+    def _voice_confidence(self, cmd):
+        try:
+            act = parse(cmd)["action"]
+        except Exception:
+            act = "query"
+        good = ("open_browser", "open_app", "open_url", "web_search",
+                "open_project", "find_files", "open_downloads",
+                "find_screenshots", "play_game", "remember_project",
+                "open_folder", "intent", "show_downloads")
+        return "high" if act in good else "low"
+
+    def _voice_suggestions(self, cmd, targets):
+        import difflib
+        toks = cmd.split()
+        base = toks[-1] if len(toks) >= 2 else (toks[0] if toks else cmd)
+        cands = difflib.get_close_matches(base, targets, n=3, cutoff=0.3)
+        sugg = [f"open {c}" for c in cands]
+        if not sugg:
+            sugg = ["open youtube", "open google", "open github"]
+        return sugg[:3]
+
+    # ── result handling ──────────────────────────────────────────────────────
+    def _voice_heard(self, raw):
+        corrected, conf, suggestions = self._voice_correct(raw)
+        self._voice_show_transcript(raw, corrected, conf)
+        low = (corrected or "").lower()
+        if any(w in low for w in self._VOICE_DANGER):
+            self._set_voice_state("ERROR", "Blocked by read-only safety mode.")
+            self._voice_active = False
+            return
+        if conf == "high" and corrected:
+            self._voice_execute(corrected)          # high → run directly
+        else:
+            # low/medium → confirm before doing anything
+            self._set_voice_state("CONFUSED", "Could not understand clearly.")
+            self._voice_active = False
+            self._voice_show_confirm(raw, corrected, suggestions)
+
+    def _voice_execute(self, cmd):
+        self._set_voice_state("EXECUTING", cmd)
+        self._voice_clear_confirm()
+        try:
+            if cmd == "__projects__":
+                self.switch_view("Projects")
+            else:
+                self.execute_command_text(cmd)      # SAME pipeline as typing
+        except Exception as e:
+            self._set_voice_state("ERROR", f"Could not run: {e}")
+            self._voice_active = False
+            return
+        self._set_voice_state("DONE", "")
+        self._voice_active = False
+        self.after(1800, self._close_voice_page)
+
+    def _voice_fail(self, message):
+        self._set_voice_state("ERROR", message)
+        self._voice_active = False
+        if hasattr(self, "_vp_corrected"):
+            self._vp_corrected.configure(text=message)
+        self._voice_show_confirm("", "", [])        # offers Try Again / Cancel
+
+    # ── voice-page helpers ───────────────────────────────────────────────────
+    def _voice_show_transcript(self, raw, corrected, conf):
+        if hasattr(self, "_vp_raw"):
+            self._vp_raw.configure(
+                text=f'Raw heard: "{raw}"' if raw else "Raw heard: —")
+        if hasattr(self, "_vp_corrected"):
+            self._vp_corrected.configure(
+                text=f"Corrected command: {corrected or '—'}")
+        cmap = {"high": ("High", NEON_GREEN), "medium": ("Medium", NEON_ORANGE),
+                "low": ("Low", NEON_PINK)}
+        label, col = cmap.get(conf, ("", "#607090"))
+        if hasattr(self, "_vp_conf"):
+            self._vp_conf.configure(
+                text=(f"Confidence: {label}" if label else ""), text_color=col)
+        if hasattr(self, "_voice_heard_lbl") and raw:
+            self._voice_heard_lbl.configure(text=f'🗣  Heard: "{raw}"')
+        if hasattr(self, "_voice_exec_lbl") and corrected:
+            self._voice_exec_lbl.configure(text=f"→ {corrected}")
+
+    def _voice_clear_confirm(self):
+        for box in ("_vp_sugg_box", "_vp_confirm_box"):
+            b = getattr(self, box, None)
+            if b is not None:
+                for w in b.winfo_children():
+                    w.destroy()
+
+    def _voice_show_confirm(self, raw, corrected, suggestions):
+        self._voice_clear_confirm()
+        if not hasattr(self, "_vp_sugg_box"):
+            return
+        if suggestions:
+            ctk.CTkLabel(self._vp_sugg_box, text="Did you mean:",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color="#8090b0").pack(anchor="w")
+            for s in suggestions:
+                ctk.CTkButton(
+                    self._vp_sugg_box, text=f"🔹  {s}", anchor="w", height=28,
+                    corner_radius=8, fg_color=GLASS_BG, hover_color=GLASS_HOVER,
+                    border_width=1, border_color=GLASS_BORDER,
+                    font=ctk.CTkFont(size=12),
+                    command=lambda c=s: self._voice_confirm_run(c)
+                ).pack(anchor="w", fill="x", pady=2)
+        if corrected:
+            ctk.CTkButton(
+                self._vp_confirm_box, text=f"✅ Execute: {corrected}",
+                height=30, corner_radius=8, fg_color="#1a4a1a",
+                hover_color="#226622", font=ctk.CTkFont(size=12),
+                command=lambda c=corrected: self._voice_confirm_run(c)
+            ).pack(side="left", padx=(0, 6), pady=4)
+        ctk.CTkButton(
+            self._vp_confirm_box, text="🔁 Try Again", height=30,
+            corner_radius=8, fg_color=ACCENT, hover_color="#3a4db0",
+            font=ctk.CTkFont(size=12), command=self._voice_retry
+        ).pack(side="left", padx=(0, 6), pady=4)
+        ctk.CTkButton(
+            self._vp_confirm_box, text="✖ Cancel", height=30, corner_radius=8,
+            fg_color="#3a1a1a", hover_color="#662222",
+            font=ctk.CTkFont(size=12), command=self._voice_cancel
+        ).pack(side="left", pady=4)
+
+    def _voice_confirm_run(self, cmd):
+        self._voice_clear_confirm()
+        self._voice_execute(cmd)
+
+    def _voice_retry(self):
+        self._voice_clear_confirm()
+        if not HAS_VOICE:
+            self._set_voice_state("ERROR", "")
+            return
+        self._voice_active = True
+        self._set_voice_state("ACTIVATING", "Initializing microphone…")
+        threading.Thread(target=self._voice_worker, daemon=True).start()
+
+    def _voice_cancel(self):
+        self._voice_active = False
+        self._voice_clear_confirm()
+        self._close_voice_page()
+        self._set_voice_state("IDLE")
+
+    def _set_voice_state(self, state, detail=""):
+        """Update the Voice page, the mini Mission-Control panel + buttons."""
+        self._voice_state = state
+        labels = {
+            "IDLE":       ("🎤 Voice Off", "#8090b0"),
+            "ACTIVATING": ("⏳ Initializing microphone…", NEON_CYAN),
+            "LISTENING":  ("🎤 Listening…", NEON_GREEN),
+            "HEARING":    ("👂 Hearing voice…", NEON_CYAN),
+            "PROCESSING": ("🧠 Understanding command…", NEON_PURPLE),
+            "EXECUTING":  ("⚡ Executing…", NEON_ORANGE),
+            "DONE":       ("✅ Done", NEON_GREEN),
+            "CONFUSED":   ("🤔 Could not understand", NEON_ORANGE),
+            "ERROR":      ("⚠ Voice error", NEON_ORANGE),
+        }
+        text, color = labels.get(state, ("🎤 Voice", "#8090b0"))
+        for attr in ("_vp_state", "_voice_state_lbl"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.configure(text=text, text_color=color)
+        if detail and hasattr(self, "_voice_detail_lbl"):
+            self._voice_detail_lbl.configure(text=detail)
+        active = state in ("ACTIVATING", "LISTENING", "HEARING", "PROCESSING")
+        if hasattr(self, "_voice_btn"):
+            self._voice_btn.configure(
+                text="🔴 Voice: ON" if active else "🎤 Voice",
+                fg_color="#7a1d4a" if active else "#7a3db8")
+        if hasattr(self, "_voice_icon_btn"):
+            self._voice_icon_btn.configure(
+                fg_color="#c0306a" if active else "#7a3db8")
+
+    def _normalize_voice(self, raw):
+        """Light rule-based casual/Hinglish → command normalisation.
+        Most Hinglish (chrome kholo, youtube kholo aur python search karo,
+        downloads kholo) is already understood by the parser, so we only
+        clean up speech artifacts + a couple of patterns it can't handle."""
+        import re
+        t = " ".join((raw or "").lower().split())
+        if not t:
+            return t
+        t = (t.replace("you tube", "youtube").replace("v s code", "vscode")
+             .replace("vs code", "vscode").replace("git hub", "github")
+             .replace("get hub", "github"))
+        # "<site> me <X> search karo"  /  "<X> search karo <site> me"
+        if "search" in t and "youtube" in t:
+            term = re.sub(
+                r"\b(youtube|kholo|khol|aur|me|mein|par|pe|search|karo|kar|"
+                r"kro|and|open|on|in)\b", " ", t)
+            term = " ".join(term.split())
+            if term:
+                return f"open youtube and search {term}"
+        if "search" in t and "google" in t:
+            term = re.sub(
+                r"\b(google|kholo|aur|me|mein|search|karo|kar|kro|and|open|"
+                r"on|in)\b", " ", t)
+            term = " ".join(term.split())
+            if term:
+                return f"search {term} on google"
+        # Hinglish project open: "mera project kholo", "project kholo"
+        if "project" in t and re.search(r"\b(kholo|khol)\b", t):
+            name = re.sub(r"\b(mera|meri|mere|my|kholo|khol|karo|the|a|an)\b",
+                          " ", t).replace("project", " ")
+            name = " ".join(name.split())
+            return f"open {name} project" if name else "__projects__"
+        return t
 
     # async + dashboard views
     def _load_async(self, fetch, label, group_as_files=False):
@@ -3459,6 +4058,7 @@ class FileMindApp(ctk.CTk):
             self.after(0, done, rows)
 
         def done(rows):
+            print(f"[search] '{label}' returned {len(rows)} files")
             if group_as_files:
                 self._show_search_groups(label, [], rows)
             else:
