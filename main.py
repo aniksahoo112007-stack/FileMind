@@ -10,6 +10,7 @@ Run:  python main.py
 
 import ctypes
 import os
+import queue
 import shutil
 import threading
 import tkinter as tk
@@ -275,6 +276,14 @@ class FileMindApp(ctk.CTk):
         self._header_job = None        # debounce handle for header redraw
         self._is_resizing = False      # True while the window is being dragged
         self._voice_active = False     # True while a voice session is running
+
+        # ── thread-safe UI marshalling ────────────────────────────────────
+        # Worker threads must NEVER touch Tkinter (not even .after, which is a
+        # Tcl call and raises "main thread is not in main loop" off-thread).
+        # They enqueue callables here; a main-thread drain loop runs them.
+        self._ui_queue = queue.Queue()
+        self._alive = True
+        self.after(40, self._drain_ui_queue)
         self._voice_state = "IDLE"     # IDLE/ACTIVATING/LISTENING/…
         self._voice_pulse_on = False
         self._whisper_model = None     # faster-whisper model (lazy-loaded)
@@ -505,6 +514,14 @@ class FileMindApp(ctk.CTk):
         c.create_text(w - 65, h // 2, anchor="center",
                       text="🔒 READ-ONLY",
                       font=("Segoe UI", 9, "bold"), fill=NEON_GREEN)
+
+        # creator branding (subtle, centered — premium, no layout shift)
+        c.create_text(w // 2, h // 2, anchor="center",
+                      text="✦  FileMind by Anik  ✦",
+                      font=("Segoe UI", 11, "bold"), fill="#6e7bd6")
+        c.create_text(w // 2, h // 2 + 15, anchor="center",
+                      text="built by Anik Sahoo",
+                      font=("Segoe UI", 8), fill="#3f4a78")
 
     # ───────────────────────── responsive / multi-monitor ─────────────────────
     def _on_window_configure(self, event):
@@ -812,15 +829,49 @@ class FileMindApp(ctk.CTk):
         "Ready":      (NEON_GREEN, "🧠 Ready"),
     }
 
+    # ── thread-safe UI marshalling ─────────────────────────────────────────
+    def post(self, fn, *args):
+        """Schedule `fn(*args)` to run on the MAIN (UI) thread.
+
+        Safe to call from any worker thread: it only does a thread-safe
+        queue.put — it never touches Tkinter. The main-thread drain loop
+        (_drain_ui_queue) executes the callables. This replaces the old,
+        unsafe ``self.post(…)`` calls made from background threads, which
+        could raise ``RuntimeError: main thread is not in main loop`` and kill
+        the worker (leaving the AI Brain "Offline" and counters blank)."""
+        try:
+            self._ui_queue.put_nowait((fn, args))
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        """Runs ONLY on the main thread (via after). Executes queued UI work."""
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception as e:
+                    print("[ui-queue] callback error:", e)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print("[ui-queue] drain error:", e)
+        finally:
+            if getattr(self, "_alive", True):
+                self.after(16, self._drain_ui_queue)   # ~60Hz, main thread
+
     def _build_brain_visualizer(self, parent):
-        box = ctk.CTkFrame(parent, fg_color="transparent")
-        box.grid(row=1, column=0, sticky="nw", padx=12, pady=(0, 10))
-        ctk.CTkLabel(box, text="🧠  AI BRAIN",
+        box = ctk.CTkFrame(parent, fg_color="#0e1530", corner_radius=10,
+                           border_width=1, border_color="#2a3550")
+        box.grid(row=1, column=0, sticky="nw", padx=10, pady=(0, 6))
+        self._brain_box = box   # glows when the AI Brain is online
+        ctk.CTkLabel(box, text="🧠  AI BRAIN", fg_color="transparent",
                      font=ctk.CTkFont(size=10, weight="bold"),
-                     text_color="#506080").pack(anchor="w")
+                     text_color="#506080").pack(anchor="w", padx=8, pady=(4, 0))
         self._brain_canvas = tk.Canvas(box, width=120, height=96,
-                                       bg="#12182e", highlightthickness=0, bd=0)
-        self._brain_canvas.pack(anchor="w", pady=(2, 2))
+                                       bg="#0e1530", highlightthickness=0, bd=0)
+        self._brain_canvas.pack(anchor="w", pady=(2, 2), padx=8)
         self._brain_state = "Offline"
         self._brain_busy = False
         self._brain_phase = 0
@@ -865,9 +916,11 @@ class FileMindApp(ctk.CTk):
         c = getattr(self, "_brain_canvas", None)
         if c is None:
             return
-        if getattr(self, "_is_resizing", False):
-            # pause canvas redraws while the window is being dragged
-            self.after(130, self._animate_brain)
+        # pause redraws while dragging OR when the dashboard isn't on screen
+        ds = getattr(self, "dash_scroll", None)
+        if getattr(self, "_is_resizing", False) or (
+                ds is not None and not ds.winfo_ismapped()):
+            self.after(200, self._animate_brain)
             return
         try:
             self._brain_phase = (self._brain_phase + 1) % 1000
@@ -885,6 +938,17 @@ class FileMindApp(ctk.CTk):
                 c.create_oval(cx - r, cy - r, cx + r, cy + r,
                               outline=color, width=2)
             c.create_text(cx, cy, text="🧠", font=("Segoe UI", 18))
+            # subtle neon border glow on the AI Brain card
+            box = getattr(self, "_brain_box", None)
+            if box is not None:
+                if self._brain_state == "Offline":
+                    box.configure(border_color="#2a3550")
+                elif self._brain_state == "Ready":
+                    box.configure(border_color=(
+                        NEON_GREEN if (self._brain_phase // 6) % 2 == 0
+                        else "#1c5a2c"))
+                else:
+                    box.configure(border_color=color)
         except Exception:
             pass
         self.after(130, self._animate_brain)
@@ -1113,7 +1177,7 @@ class FileMindApp(ctk.CTk):
                         check_gpu=getattr(self, "_check_gpu", True))
                 except Exception:
                     data = {}
-                self.after(0, self._apply_metrics, data)
+                self.post(self._apply_metrics, data)
 
             threading.Thread(target=work, daemon=True).start()
         # reschedule regardless (every 2 s)
@@ -2007,7 +2071,7 @@ class FileMindApp(ctk.CTk):
                 "| double-click file = open prompt")
 
         threading.Thread(
-            target=lambda: self.after(0, done, fetch()), daemon=True).start()
+            target=lambda: self.post(done, fetch()), daemon=True).start()
 
     # ─── navigation history ───────────────────────────────────────────────────
 
@@ -2109,7 +2173,7 @@ class FileMindApp(ctk.CTk):
         def work():
             project = self.projects.best(topic)
             files   = self.search.quick_search(topic, 100)
-            self.after(0, done, project, files)
+            self.post(done, project, files)
 
         def done(project, files):
             sections = []
@@ -2224,9 +2288,9 @@ class FileMindApp(ctk.CTk):
             try:
                 rows = self.search.ranked_search(q, RESULT_LIMIT)
             except Exception as e:
-                self.after(0, self._set_status, f"Detective error: {e}")
+                self.post(self._set_status, f"Detective error: {e}")
                 return
-            self.after(0, done, rows)
+            self.post(done, rows)
 
         def done(rows):
             self._show_search_groups(q, [], rows)   # existing display + table
@@ -2371,7 +2435,7 @@ class FileMindApp(ctk.CTk):
             if app:
                 app = dict(app)
                 app["icon_png"] = icon_extractor.get_icon_png(app["path"])
-            self.after(0, done, app, rows)
+            self.post(done, app, rows)
 
         def done(app, rows):
             self._show_search_groups(
@@ -2407,7 +2471,7 @@ class FileMindApp(ctk.CTk):
                           created_date, modified_date, file_type
                    FROM files WHERE file_type = 'Folders' AND name LIKE ?
                    ORDER BY LENGTH(path) LIMIT 25""", (f"%{name}%",))
-            self.after(0, done, rows)
+            self.post(done, rows)
 
         def done(rows):
             if rows:
@@ -2445,18 +2509,24 @@ class FileMindApp(ctk.CTk):
                 brain_color = NEON_ORANGE
 
             def _upd():
-                if hasattr(self, "_brain_status_lbl"):
-                    self._brain_status_lbl.configure(
-                        text=brain_txt, text_color=brain_color)
-                if hasattr(self, "_cc_brain"):
-                    self._cc_brain.configure(
-                        text="LM Studio: " + ("Online" if lm_ok else "Offline"))
-                # drive the brain visualizer (but never override an active search)
-                if not getattr(self, "_brain_busy", False):
-                    self._set_brain_state("Ready" if lm_ok else "Offline")
-                # reschedule next poll on the main thread
-                self.after(5000, self._update_ai_status)
-            self.after(0, _upd)
+                # reschedule FIRST so the poll keeps running even if a single
+                # UI update hiccups (main thread only).
+                if getattr(self, "_alive", True):
+                    self.after(5000, self._update_ai_status)
+                try:
+                    if hasattr(self, "_brain_status_lbl"):
+                        self._brain_status_lbl.configure(
+                            text=brain_txt, text_color=brain_color)
+                    if hasattr(self, "_cc_brain"):
+                        self._cc_brain.configure(
+                            text="LM Studio: "
+                                 + ("Online" if lm_ok else "Offline"))
+                    # drive the brain visualizer (never override active search)
+                    if not getattr(self, "_brain_busy", False):
+                        self._set_brain_state("Ready" if lm_ok else "Offline")
+                except Exception as e:
+                    print("[ai-status] UI update error:", e)
+            self.post(_upd)
 
         threading.Thread(target=check, daemon=True).start()
 
@@ -2470,7 +2540,7 @@ class FileMindApp(ctk.CTk):
 
         def work():
             result = lmstudio_client.ask_lmstudio(text)
-            self.after(0, done, result)
+            self.post(done, result)
 
         def done(result):
             if result is None:
@@ -2559,7 +2629,7 @@ class FileMindApp(ctk.CTk):
 
         def on_progress(count, name, fps):
             fps_str = f"  {fps:.1f} files/sec" if fps > 0 else ""
-            self.after(0, self._set_status,
+            self.post(self._set_status,
                        f"🤖 Indexed {count}{fps_str}  ·  {name[:55]}")
 
         def on_done(total):
@@ -2574,7 +2644,7 @@ class FileMindApp(ctk.CTk):
                 except Exception:
                     pass
                 self.after(500, self._update_ai_status)
-            self.after(0, _finish)
+            self.post(_finish)
 
         self._doc_indexer.start(on_progress=on_progress, on_done=on_done)
 
@@ -2934,10 +3004,10 @@ class FileMindApp(ctk.CTk):
             try:
                 groups = self._ai_search_files(info, query)
             except Exception as e:
-                self.after(0, self._set_status, f"AI Search error: {e}")
-                self.after(0, self._brain_done)
+                self.post(self._set_status, f"AI Search error: {e}")
+                self.post(self._brain_done)
                 return
-            self.after(0, self._present_ai_results, query, info, groups)
+            self.post(self._present_ai_results, query, info, groups)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -3274,7 +3344,7 @@ class FileMindApp(ctk.CTk):
                 except Exception:
                     online = False
             if not online:
-                self.after(0, _offline)
+                self.post(_offline)
                 return
 
             # get a text snippet from the DB if indexed, else read directly
@@ -3295,7 +3365,7 @@ class FileMindApp(ctk.CTk):
                     pass
 
             summary = lmstudio_client.explain_file(name, snippet)
-            self.after(0, _done, summary)
+            self.post(_done, summary)
 
         def _offline():
             self._explain_btn.configure(state="normal",
@@ -3338,7 +3408,7 @@ class FileMindApp(ctk.CTk):
     def _play_game(self, name, fallback_app=False):
         def work():
             game = games_mod.find_game(self.db, name)
-            self.after(0, done, game)
+            self.post(done, game)
 
         def done(game):
             if game:
@@ -3524,7 +3594,7 @@ class FileMindApp(ctk.CTk):
             for a in apps:
                 a["icon_png"] = icon_extractor.get_icon_png(a["path"])
             files = self.search.quick_search(query, 200)
-            self.after(0, done, apps, files)
+            self.post(done, apps, files)
 
         def done(apps, files):
             self._show_search_groups(query,
@@ -3713,7 +3783,7 @@ class FileMindApp(ctk.CTk):
                 if rows else "No apps indexed yet - click 'Scan Apps'.")
 
         threading.Thread(
-            target=lambda: self.after(0, done, fetch()), daemon=True).start()
+            target=lambda: self.post(done, fetch()), daemon=True).start()
 
     def show_all_games(self):
         def fetch():
@@ -3726,7 +3796,7 @@ class FileMindApp(ctk.CTk):
                 if rows else "No games found - click 'Scan Games'.")
 
         threading.Thread(
-            target=lambda: self.after(0, done, fetch()), daemon=True).start()
+            target=lambda: self.post(done, fetch()), daemon=True).start()
 
     def show_all_projects(self):
         rows = [self._project_to_row(p) for p in self.projects.all()]
@@ -3770,7 +3840,7 @@ class FileMindApp(ctk.CTk):
                 if items else "No commands run yet.")
 
         threading.Thread(
-            target=lambda: self.after(0, done, fetch()), daemon=True).start()
+            target=lambda: self.post(done, fetch()), daemon=True).start()
 
     # scans
     def start_scan(self):
@@ -3782,9 +3852,9 @@ class FileMindApp(ctk.CTk):
         self._set_busy(True)
         self._set_status("Scanning drives...")
         self.scanner.start(
-            on_progress=lambda n, p: self.after(
-                0, self._set_status, f"Indexed {n:,} files...  {p[:60]}"),
-            on_done=lambda n: self.after(0, self._scan_done, n),
+            on_progress=lambda n, p: self.post(
+                self._set_status, f"Indexed {n:,} files...  {p[:60]}"),
+            on_done=lambda n: self.post(self._scan_done, n),
         )
 
     def _scan_done(self, n):
@@ -3801,7 +3871,7 @@ class FileMindApp(ctk.CTk):
         self.app_scan_btn.configure(text="🚀 Scanning...")
         self._set_busy(True)
         self.app_scanner.start(
-            on_done=lambda n: self.after(0, self._app_scan_done, n))
+            on_done=lambda n: self.post(self._app_scan_done, n))
 
     def _app_scan_done(self, n):
         self._set_busy(False)
@@ -3817,7 +3887,7 @@ class FileMindApp(ctk.CTk):
         self.game_scan_btn.configure(text="🎮 Scanning...")
         self._set_busy(True)
         self.game_scanner.start(
-            on_done=lambda n: self.after(0, self._game_scan_done, n))
+            on_done=lambda n: self.post(self._game_scan_done, n))
 
     def _game_scan_done(self, n):
         self._set_busy(False)
@@ -3899,7 +3969,7 @@ class FileMindApp(ctk.CTk):
                       command=self._voice_cancel).grid(row=0, column=2,
                                                        sticky="e")
 
-        self._vp_orb = tk.Canvas(page, width=150, height=150, bg="#0d1424",
+        self._vp_orb = tk.Canvas(page, width=240, height=190, bg="#0d1424",
                                  highlightthickness=0, bd=0)
         self._vp_orb.grid(row=1, column=0, pady=(6, 0))
         self._vp_state = ctk.CTkLabel(
@@ -3979,14 +4049,28 @@ class FileMindApp(ctk.CTk):
                  "ACTIVATING": NEON_CYAN}.get(state, "#5a6680")
         busy = state in ("LISTENING", "HEARING", "PROCESSING", "ACTIVATING")
         speed = 0.5 if busy else 0.18
-        cx, cy = 75, 75
+        cx, cy = 120, 62
         c.delete("all")
-        for i, base in enumerate((52, 40, 28, 16)):
+        # pulsing mic orb (concentric neon rings)
+        for i, base in enumerate((48, 37, 26, 15)):
             amp = 6 if busy else 2
             r = base + amp * math.sin(self._vp_phase * speed - i * 0.6)
             c.create_oval(cx - r, cy - r, cx + r, cy + r,
                           outline=color, width=2)
-        c.create_text(cx, cy, text="🎤", font=("Segoe UI", 28))
+        c.create_text(cx, cy, text="🎤", font=("Segoe UI", 26))
+        # animated waveform bars (move while listening / hearing)
+        listening = state in ("LISTENING", "HEARING")
+        baseline, n = 158, 21
+        for i in range(n):
+            x = 14 + i * (212 / (n - 1))
+            if listening:
+                amp = (abs(math.sin(self._vp_phase * 0.45 + i * 0.6))
+                       * abs(math.sin(self._vp_phase * 0.17 + i * 0.3)))
+                bh = 3 + amp * 26
+            else:
+                bh = 2
+            c.create_line(x, baseline - bh, x, baseline + bh,
+                          fill=color, width=3)
         self.after(150, self._voice_orb)
 
     # ── flow ─────────────────────────────────────────────────────────────────
@@ -4020,7 +4104,7 @@ class FileMindApp(ctk.CTk):
                     continue
             if self._whisper_model is None:
                 raise RuntimeError("Whisper model could not be loaded.")
-            self.after(0, lambda: hasattr(self, "_vp_model") and
+            self.post(lambda: hasattr(self, "_vp_model") and
                        self._vp_model.configure(
                            text=f"Whisper '{self._whisper_size}' loaded"))
         return self._whisper_model
@@ -4050,18 +4134,18 @@ class FileMindApp(ctk.CTk):
     def _voice_worker(self):
         """Record + transcribe off-thread. Never blocks the mainloop."""
         try:
-            self.after(0, self._set_voice_state, "LISTENING", "Speak now…")
+            self.post(self._set_voice_state, "LISTENING", "Speak now…")
             audio = self._record_audio()
             if audio is None:
-                self.after(0, self._voice_fail, "Microphone not detected")
+                self.post(self._voice_fail, "Microphone not detected")
                 return
-            self.after(0, self._set_voice_state, "HEARING", "")
-            self.after(0, self._set_voice_state,
+            self.post(self._set_voice_state, "HEARING", "")
+            self.post(self._set_voice_state,
                        "PROCESSING", "Transcribing with Whisper…")
             try:
                 model = self._get_whisper_model()
             except Exception as e:
-                self.after(0, self._voice_fail, f"Whisper load failed: {e}")
+                self.post(self._voice_fail, f"Whisper load failed: {e}")
                 return
             try:
                 kw = dict(beam_size=5, best_of=5, temperature=0, language="en")
@@ -4071,15 +4155,15 @@ class FileMindApp(ctk.CTk):
                     segments, _i = model.transcribe(audio, **kw)
                 text = " ".join(s.text for s in segments).strip()
             except Exception as e:
-                self.after(0, self._voice_fail, f"Transcription failed: {e}")
+                self.post(self._voice_fail, f"Transcription failed: {e}")
                 return
             if not text:
-                self.after(0, self._voice_fail,
+                self.post(self._voice_fail,
                            "Could not hear clearly. Try again.")
                 return
-            self.after(0, self._voice_heard, text)
+            self.post(self._voice_heard, text)
         except Exception as e:
-            self.after(0, self._voice_fail, f"Voice error: {e}")
+            self.post(self._voice_fail, f"Voice error: {e}")
 
     # ── correction + intent (Parts D / E) ────────────────────────────────────
     def _voice_targets(self):
@@ -4356,9 +4440,9 @@ class FileMindApp(ctk.CTk):
             try:
                 rows = fetch()
             except Exception as e:
-                self.after(0, self._set_status, f"Error: {e}")
+                self.post(self._set_status, f"Error: {e}")
                 return
-            self.after(0, done, rows)
+            self.post(done, rows)
 
         def done(rows):
             print(f"[search] '{label}' returned {len(rows)} files")
@@ -4412,7 +4496,7 @@ class FileMindApp(ctk.CTk):
                 f"{self.db.count():,} total items.")
 
         threading.Thread(
-            target=lambda: self.after(0, done, fetch()), daemon=True).start()
+            target=lambda: self.post(done, fetch()), daemon=True).start()
 
     # ══════════════════════════════════════════ utility / callbacks ═══════════
 
@@ -4452,7 +4536,7 @@ class FileMindApp(ctk.CTk):
                 pass
 
         threading.Thread(
-            target=lambda: self.after(0, done, fetch()), daemon=True).start()
+            target=lambda: self.post(done, fetch()), daemon=True).start()
 
     # ── voice callbacks ───────────────────────────────────────────────────────
 
@@ -4488,4 +4572,18 @@ class FileMindApp(ctk.CTk):
 
 if __name__ == "__main__":
     app = FileMindApp()
+
+    def _on_close():
+        # Stop the UI drain / animation loops cleanly so no pending after()
+        # callback fires during teardown.
+        app._alive = False
+        try:
+            app.destroy()
+        except Exception:
+            pass
+
+    try:
+        app.protocol("WM_DELETE_WINDOW", _on_close)
+    except Exception:
+        pass
     app.mainloop()
